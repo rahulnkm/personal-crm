@@ -160,7 +160,15 @@ def add(
             {"contact_id": c["id"], "source": f"agent:{agent}", "email": email}
         ).execute()
     except Exception as exc:
-        err(f"contact created ({c['id']}) but identity insert failed: {exc}")
+        # roll back the just-created orphan so a half-completed add never reports
+        # success — the contact has no other references yet, so deleting it is safe
+        try:
+            client.table("contacts").delete().eq("id", c["id"]).execute()
+            rolled = f"rolled back contact {c['id']}"
+        except Exception as del_exc:
+            rolled = f"FAILED to roll back contact {c['id']} ({del_exc}) — delete it manually"
+        err(f"identity insert failed ({exc}); {rolled}")
+        raise typer.Exit(1)
     typer.echo(c["id"])
 
 

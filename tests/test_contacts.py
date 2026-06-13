@@ -70,3 +70,35 @@ def test_set_invalid_enum_fails_cleanly(db):
     assert r.exit_code == 1
     r = runner.invoke(app, ["add", "X Y", "--status", "nonsense"])
     assert r.exit_code == 1
+
+
+def test_add_rolls_back_orphan_when_identity_insert_fails(db, monkeypatch):
+    """If the contact is created but the identity insert fails, add() must NOT
+    report success — it rolls back the orphan contact and exits non-zero, so a
+    scripted caller can tell the create half-failed."""
+    from crm.commands import contacts as contacts_mod
+
+    real = contacts_mod.get_client()  # db fixture has pointed env at the local stack
+
+    class _RaisingExec:
+        def execute(self):
+            raise RuntimeError("simulated identity insert failure")
+
+    class _RaisingIdentities:
+        def insert(self, *a, **k):
+            return _RaisingExec()
+
+    class _Proxy:
+        """Delegates everything to the real client except contact_identities
+        inserts, which fail — simulating a DB error on the second write."""
+        def table(self, name):
+            return _RaisingIdentities() if name == "contact_identities" else real.table(name)
+        def __getattr__(self, name):
+            return getattr(real, name)
+
+    monkeypatch.setattr(contacts_mod, "get_client", lambda: _Proxy())
+
+    r = runner.invoke(app, ["add", "Orphan Probe", "--agent", "rahul"])
+    assert r.exit_code == 1, r.output
+    left = real.table("contacts").select("id").eq("full_name", "Orphan Probe").execute().data
+    assert left == [], "orphan contact must be rolled back, not left behind"
