@@ -1,0 +1,30 @@
+[project]
+name = "crm"
+version = "0.1.0"
+description = "Personal CRM data layer CLI — Rahul's real-network base"
+requires-python = ">=3.12"
+dependencies = [
+    "typer>=0.26",
+    "supabase>=2.31",
+    "phonenumbers>=8.13",
+    "python-dotenv>=1.0",
+]
+
+[dependency-groups]
+dev = [
+    "httpx>=0.28.1",
+    "pytest>=8.0",
+]
+
+[project.scripts]
+crm = "crm.cli:main"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/crm"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

@@ -1,0 +1,12 @@
+.env
+.venv/
+__pycache__/
+*.pyc
+supabase/.temp/
+.crm-checkpoints/
+dist/
+*.egg-info/
+.env.local
+
+# agent workflow artifacts (handoffs, diagrams) — local only
+.claude/
