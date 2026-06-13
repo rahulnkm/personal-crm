@@ -23,6 +23,10 @@ from crm.output import err
 
 BATCH = 200
 HEADER_PREFIX = "First Name,Last Name,URL"
+# Ceiling on the uncompressed size of the Connections.csv we read into memory.
+# A real export is KB–low-MB even for huge networks; this guards against a
+# decompression bomb (tiny zip that inflates to many GB and OOMs the process).
+MAX_MEMBER_BYTES = 200 * 1024 * 1024  # 200 MB
 
 
 def _read_connections(path: str) -> list[dict]:
@@ -37,6 +41,11 @@ def _read_connections(path: str) -> list[dict]:
             if not member:
                 err(f"No Connections.csv inside {path}. "
                     "Re-request the export with 'Connections' checked.")
+                raise typer.Exit(1)
+            declared = zf.getinfo(member).file_size
+            if declared > MAX_MEMBER_BYTES:
+                err(f"{member} is too large ({declared} bytes uncompressed, "
+                    f"cap {MAX_MEMBER_BYTES}) — refusing to read a possible zip bomb.")
                 raise typer.Exit(1)
             text = zf.read(member).decode("utf-8-sig")
     else:

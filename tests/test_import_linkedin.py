@@ -52,6 +52,18 @@ def test_linkedin_missing_file_fails_cleanly(db):
     assert r.exit_code == 1
 
 
+def test_linkedin_zip_member_over_size_cap_fails_cleanly(db, tmp_path, monkeypatch):
+    """A zip whose Connections.csv declares an uncompressed size over the cap is
+    rejected before it's read into memory — guards against a decompression bomb.
+    Cap is lowered here so a normal small zip trips it without building a huge file."""
+    from crm.commands import import_linkedin as li_mod
+    monkeypatch.setattr(li_mod, "MAX_MEMBER_BYTES", 100, raising=False)  # CSV is > 100 bytes
+    r = runner.invoke(app, ["import", "linkedin", str(_write_zip(tmp_path))])
+    assert r.exit_code == 1, r.output
+    assert "too large" in r.output.lower()
+    assert db.table("staging").select("id").eq("source", "linkedin").execute().data == []
+
+
 def test_linkedin_reexport_with_changed_company_does_not_duplicate_touchpoint(db, tmp_path):
     """A next-year export where a connection changed Company/Position must
     REFRESH the connected-on interaction, not insert a second one — the
