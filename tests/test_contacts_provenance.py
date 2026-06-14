@@ -47,3 +47,31 @@ def test_set_array_keeps_union_path(db):
     assert r.exit_code == 0, r.output
     got = db.table("contacts").select("affiliations").eq("id", c["id"]).single().execute().data
     assert set(got["affiliations"]) == {"a", "b"}
+
+
+def test_contact_json_includes_provenance(db):
+    c = db.table("contacts").insert({"full_name": "Eve"}).execute().data[0]
+    db.rpc("enrich_apply_candidate", {
+        "p_contact_id": c["id"], "p_field": "current_company", "p_value": "Gravatar Inc",
+        "p_method": "enrich_api", "p_source": "gravatar", "p_confidence": 0.9,
+        "p_source_detail": None, "p_dry_run": False}).execute()
+    r = runner.invoke(app, ["contact", c["id"], "--json"])
+    assert r.exit_code == 0, r.output
+    import json
+    out = json.loads(r.output)
+    assert "provenance" in out
+    p = out["provenance"]["current_company"]
+    assert p["value"] == "Gravatar Inc"
+    assert p["source"] == "gravatar"
+    assert p["confidence"] == 0.9
+    assert "as_of" in p
+    assert "stale" in p
+
+
+def test_contact_json_graceful_without_provenance(db):
+    c = db.table("contacts").insert({"full_name": "Frank"}).execute().data[0]
+    r = runner.invoke(app, ["contact", c["id"], "--json"])
+    assert r.exit_code == 0, r.output
+    import json
+    out = json.loads(r.output)
+    assert out["provenance"] == {}  # no is_current rows → empty map, no error

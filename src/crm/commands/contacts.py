@@ -57,8 +57,9 @@ def contact(ref: str = typer.Argument(..., help="Contact name or uuid"),
               .select("field,old_value,new_value,source,created_at")
               .eq("contact_id", c["id"]).order("created_at", desc=True)
               .limit(20).execute().data)
+    provenance = _provenance_map(client, c["id"])
     out = {"contact": c, "identities": idents, "interactions": inter,
-           "enrichment_history": enrich}
+           "enrichment_history": enrich, "provenance": provenance}
     if as_json:
         typer.echo(json.dumps(out, default=str))
     else:
@@ -69,8 +70,34 @@ def contact(ref: str = typer.Argument(..., help="Contact name or uuid"),
             typer.echo(f"  origin: {c['origin_context']}")
         if c.get("notes"):
             typer.echo(f"  notes: {c['notes']}")
+        for field, p in provenance.items():
+            stale = " · STALE" if p["stale"] else ""
+            conf = f" · {p['confidence']}" if p["confidence"] is not None else ""
+            typer.echo(f"  {field}: {p['value']} · via {p['source']}{conf} · {p['as_of']}{stale}")
         render(idents, False)
         render(inter, False)
+
+
+def _provenance_map(client, contact_id: str) -> dict:
+    """Per-field provenance for the contact's current (is_current) enrichment rows.
+
+    Returns {field: {value, source, confidence, as_of, stale}}. Empty when the
+    contact has no provenance rows (e.g. a pre-backfill record) — never errors.
+    """
+    rows = (client.table("enrichment_log")
+            .select("field,new_value,source,confidence,created_at,refresh_after")
+            .eq("contact_id", contact_id).eq("is_current", True).execute().data)
+    today = date.today().isoformat()
+    out = {}
+    for r in rows:
+        out[r["field"]] = {
+            "value": r["new_value"],
+            "source": r["source"],
+            "confidence": r["confidence"],
+            "as_of": r["created_at"],
+            "stale": bool(r["refresh_after"]) and r["refresh_after"] < today,
+        }
+    return out
 
 
 def list_contacts(
