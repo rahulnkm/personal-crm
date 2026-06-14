@@ -83,15 +83,28 @@ def contact(ref: str = typer.Argument(..., help="Contact name or uuid"),
     idents = (client.table("contact_identities")
               .select("id,source,email,phone,linkedin_url,handle,imported_at")
               .eq("contact_id", c["id"]).execute().data)
+    # newest-first, capped — the dossier carries recent context, not the full log
     inter = (client.table("interactions")
              .select("kind,channel,occurred_at,summary,event_id,logged_by")
-             .eq("contact_id", c["id"]).order("occurred_at", desc=True).execute().data)
+             .eq("contact_id", c["id"])
+             .order("occurred_at", desc=True, nullsfirst=False)
+             .order("created_at", desc=True)
+             .limit(20).execute().data)
     enrich = (client.table("enrichment_log")
               .select("field,old_value,new_value,source,created_at")
               .eq("contact_id", c["id"]).order("created_at", desc=True)
               .limit(20).execute().data)
     provenance = _provenance_map(client, c["id"])
-    out = {"contact": c, "identities": idents, "interactions": inter,
+    # denormalized last touchpoint (maintained by the backfill RPC) — one block so
+    # the agent can draft outreach without re-deriving recency.
+    last_touchpoint = {
+        "at": c.get("last_touchpoint_at"),
+        "channel": c.get("last_touchpoint_channel"),
+        "topic": c.get("last_touchpoint_topic"),
+    }
+    out = {"contact": c, "origin_context": c.get("origin_context"),
+           "identities": idents, "interactions": inter,
+           "last_touchpoint": last_touchpoint,
            "enrichment_history": enrich, "provenance": provenance}
     if as_json:
         typer.echo(json.dumps(out, default=str))

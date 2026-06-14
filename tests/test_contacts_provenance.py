@@ -75,3 +75,58 @@ def test_contact_json_graceful_without_provenance(db):
     import json
     out = json.loads(r.output)
     assert out["provenance"] == {}  # no is_current rows → empty map, no error
+
+
+# ----- Task 16: full dossier bundle -----
+
+def test_contact_dossier_bundle(db):
+    import json
+    c = db.table("contacts").insert(
+        {"full_name": "Grace", "origin_context": "Met at a hackathon in 2024",
+         "last_touchpoint_at": "2026-04-10", "last_touchpoint_channel": "email",
+         "last_touchpoint_topic": "intro to her cofounder"}).execute().data[0]
+    db.table("interactions").insert([
+        {"contact_id": c["id"], "kind": "message", "channel": "dm",
+         "occurred_at": "2026-01-15", "summary": "first ping", "logged_by": "rahul"},
+        {"contact_id": c["id"], "kind": "email", "channel": "email",
+         "occurred_at": "2026-04-10", "summary": "intro to her cofounder",
+         "logged_by": "rahul"},
+    ]).execute()
+    r = runner.invoke(app, ["contact", c["id"], "--json"])
+    assert r.exit_code == 0, r.output
+    out = json.loads(r.output)
+    # origin_context surfaced explicitly
+    assert out["origin_context"] == "Met at a hackathon in 2024"
+    # interactions ordered desc, with the required fields
+    inter = out["interactions"]
+    assert [i["occurred_at"] for i in inter] == ["2026-04-10", "2026-01-15"]
+    assert all({"occurred_at", "channel", "summary"} <= set(i) for i in inter)
+    # last_touchpoint denormalized block
+    lt = out["last_touchpoint"]
+    assert lt["at"] == "2026-04-10"
+    assert lt["channel"] == "email"
+    assert lt["topic"] == "intro to her cofounder"
+
+
+def test_contact_dossier_interactions_limited(db):
+    import json
+    c = db.table("contacts").insert({"full_name": "Hank"}).execute().data[0]
+    rows = [{"contact_id": c["id"], "kind": "message", "channel": "dm",
+             "occurred_at": f"2026-{m:02d}-01", "summary": f"msg {m}",
+             "logged_by": "rahul"} for m in range(1, 13)] * 3  # 36 interactions
+    db.table("interactions").insert(rows).execute()
+    r = runner.invoke(app, ["contact", c["id"], "--json"])
+    assert r.exit_code == 0, r.output
+    out = json.loads(r.output)
+    assert len(out["interactions"]) <= 20
+
+
+def test_contact_dossier_no_touchpoint_graceful(db):
+    import json
+    c = db.table("contacts").insert({"full_name": "Iris"}).execute().data[0]
+    r = runner.invoke(app, ["contact", c["id"], "--json"])
+    assert r.exit_code == 0, r.output
+    out = json.loads(r.output)
+    assert out["interactions"] == []
+    assert out["last_touchpoint"]["at"] is None
+    assert "origin_context" in out
