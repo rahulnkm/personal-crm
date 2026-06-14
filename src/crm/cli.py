@@ -7,6 +7,7 @@ from crm import __version__
 from crm.commands.admin import agent_app, stats, sync_status, tags_app
 from crm.commands.contacts import add, contact, list_contacts, note, search, set_field
 from crm.commands.backfill import backfill
+from crm.commands.bulk import bulk_app
 from crm.commands.dedup import dedup, merge, review, split
 from crm.commands.import_csv import import_app
 import crm.commands.import_touchpoints  # noqa: F401  (registers import subcommand)
@@ -21,6 +22,7 @@ app = typer.Typer(help="Personal CRM — Rahul's real-network base. Pure data la
 app.add_typer(agent_app, name="agent")
 app.add_typer(tags_app, name="tags")
 app.add_typer(import_app, name="import")
+app.add_typer(bulk_app, name="bulk")
 app.command("stats")(stats)
 app.command("sync-status")(sync_status)
 app.command("dedup")(dedup)
