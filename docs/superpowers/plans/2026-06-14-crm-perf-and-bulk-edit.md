@@ -168,7 +168,18 @@ class CountingClient:
 - [ ] **Step 4: Run, verify pass.** `uv run pytest tests/test_spy.py -v` → PASS.
 - [ ] **Step 5: Commit.** `test: counting client proxy for round-trip regression`.
 
-> NOTE for later tasks: to spy a command, `monkeypatch.setattr("crm.commands.<mod>.get_client", lambda: CountingClient(real_client))`. For threaded commands (dedup/backfill) the workers call the same patched name, so all per-thread clients are counted.
+> NOTE for later tasks: to spy a command, build **one shared** spy and return it
+> on every `get_client()` call —
+> `spy = CountingClient(real_client); monkeypatch.setattr("crm.commands.<mod>.get_client", lambda: spy)`.
+> Do NOT return a fresh `CountingClient()` per call: dedup/backfill call
+> `get_client()` per worker thread, so a per-call instance gives each worker its
+> own counter and the aggregate assertion fails. Returning one shared instance
+> aggregates all threads' calls (the proxy only appends to its `.calls` list — safe
+> enough for assertions; if exactness under heavy parallelism matters, also pass
+> `--workers 1` to the command under test). Assert via the **targeted** API
+> (`spy.count("contacts","update")`, `spy.rpc_count("bulk_upsert_interactions")`),
+> not `spy.total()`, since commands also issue `require_agent`/`_load_pending`/
+> `build_plan` calls.
 
 ---
 
@@ -178,20 +189,20 @@ class CountingClient:
 
 **Files:** Create `supabase/migrations/0006_perf_rpcs.sql`, `tests/test_perf_rpcs.py`
 
-- [ ] **Step 1: Write behavioral tests (failing).** `tests/test_perf_rpcs.py` — model on `tests/test_dedup_rpcs.py`. Seed a contact + agent, then:
+- [ ] **Step 1: Write behavioral tests (failing).** `tests/test_perf_rpcs.py` — model on `tests/test_dedup_rpcs.py`. The conftest fixture is named **`db`** and IS the supabase client (use `db.table(...)`/`db.rpc(...)`); the `rahul` agent is already seeded by migration 0001 and survives truncation, so no agent fixture is needed:
 ```python
-def test_bulk_upsert_interactions_inserts_then_refreshes(db, client, seed_agent):
-    cid = client.table("contacts").insert({"full_name": "A"}).execute().data[0]["id"]
+def test_bulk_upsert_interactions_inserts_then_refreshes(db):
+    cid = db.table("contacts").insert({"full_name": "A"}).execute().data[0]["id"]
     payload = [{"contact_id": cid, "event_id": None, "kind": "email",
                 "channel": "irl", "occurred_at": "2026-01-01", "summary": "hi",
                 "logged_by": "rahul", "source": "test", "source_external_id": "x1"}]
-    client.rpc("bulk_upsert_interactions", {"payload": payload}).execute()
-    rows = client.table("interactions").select("*").eq("source_external_id", "x1").execute().data
+    db.rpc("bulk_upsert_interactions", {"payload": payload}).execute()
+    rows = db.table("interactions").select("*").eq("source_external_id", "x1").execute().data
     assert len(rows) == 1 and rows[0]["summary"] == "hi"
     # refresh in place: mutate summary, keep kind/channel/logged_by
     payload[0]["summary"] = "updated"; payload[0]["kind"] = "call"  # kind must NOT change
-    client.rpc("bulk_upsert_interactions", {"payload": payload}).execute()
-    rows = client.table("interactions").select("*").eq("source_external_id", "x1").execute().data
+    db.rpc("bulk_upsert_interactions", {"payload": payload}).execute()
+    rows = db.table("interactions").select("*").eq("source_external_id", "x1").execute().data
     assert len(rows) == 1                      # no duplicate
     assert rows[0]["summary"] == "updated"     # mutable col refreshed
     assert rows[0]["kind"] == "email"          # immutable col preserved
