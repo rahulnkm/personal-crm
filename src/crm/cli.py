@@ -15,7 +15,7 @@ import crm.commands.import_linkedin  # noqa: F401  (registers import subcommand)
 import crm.commands.import_apple  # noqa: F401  (registers import subcommand)
 import crm.commands.import_imessage  # noqa: F401  (registers import subcommand)
 from crm.commands.log import event_app, log
-from crm.commands.retrieval import capsules
+from crm.commands.retrieval import capsules, find
 from crm.output import err
 
 app = typer.Typer(help="Personal CRM — Rahul's real-network base. Pure data layer.")
@@ -34,6 +34,7 @@ app.command("contact")(contact)
 app.command("list")(list_contacts)
 app.command("search")(search)
 app.command("capsules")(capsules)
+app.command("find")(find)
 app.command("add")(add)
 app.command("set")(set_field)
 app.command("note")(note)

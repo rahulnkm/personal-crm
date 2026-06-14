@@ -1,25 +1,43 @@
 """Retrieval surface for in-context semantic matching.
 
 `crm capsules` emits one compact object per contact — the searchable representation
-Claude Code reads to reason over the network. No embeddings, no LLM calls here.
+Claude Code reads to reason over the network. `crm find` adds a hybrid prefilter
+(structured flags UNION keyword-overlap from a plain-language intent) and returns
+the candidate pool for the agent to rank. No embeddings, no LLM calls here.
 """
 import json
+import re
 
 import typer
 
-from crm.commands.contacts import apply_contact_filters
+from crm.commands.contacts import _safe_ilike, apply_contact_filters
 from crm.config import get_client
+from crm.output import err
 
 # How far past PostgREST's 1,000-row response cap we page when materializing the
 # full capsule set. range() asks for [start, end] inclusive.
 PAGE = 1000
 NOTE_MAX = 140      # capsule note truncation budget (chars)
 TOPICS_MAX = 2      # top-N recent interaction summaries per capsule
+FIND_POOL_CAP = 300  # candidate ceiling for crm find (logged, never silent)
 
 CAPSULE_COLS = (
     "id,full_name,current_role,current_company,company_category,location,"
     "closeness_tier,affiliations,tags,expertise,notes,last_touchpoint_at"
 )
+# capsule columns the keyword prefilter searches. Scalar text → substring (ilike);
+# text[] → element-contains (cs), since ilike can't apply to an array. (topics live
+# in interactions.summary — searched separately, they're not a contacts column.)
+FIND_TEXT_COLS = ["company_category", "notes"]
+FIND_ARRAY_COLS = ["expertise", "tags"]
+# common words that carry no retrieval signal — dropped from intent tokenization.
+STOPWORDS = {
+    "a", "an", "and", "any", "are", "as", "at", "be", "by", "can", "do", "for",
+    "from", "has", "have", "i", "in", "is", "it", "me", "my", "of", "on", "or",
+    "she", "he", "that", "the", "to", "who", "whom", "with", "you", "your",
+    "someone", "people", "person", "know", "find", "good", "need", "want",
+    "looking", "leader", "expert",
+}
 
 
 def _truncate(text: str | None, limit: int = NOTE_MAX) -> str:
@@ -153,5 +171,91 @@ def capsules(
     if as_json:
         typer.echo(json.dumps(caps, default=str))
     else:
+        for cap in caps:
+            typer.echo(json.dumps(cap, default=str))
+
+
+def _intent_tokens(intent: str) -> list[str]:
+    """Lowercase alnum tokens from the intent, stopwords + short tokens dropped,
+    each made or_()-safe."""
+    raw = re.findall(r"[A-Za-z0-9][A-Za-z0-9\-]+", intent.lower())
+    out: list[str] = []
+    for tok in raw:
+        if tok in STOPWORDS or len(tok) < 3:
+            continue
+        safe = _safe_ilike(tok)
+        if safe and safe not in out:
+            out.append(safe)
+    return out
+
+
+def find(
+    intent: str = typer.Argument(..., help="Plain-language description of who you want"),
+    status: str = typer.Option(None, "--status"),
+    tier: str = typer.Option(None, "--tier"),
+    tag: str = typer.Option(None, "--tag"),
+    affiliation: str = typer.Option(None, "--affiliation"),
+    role: str = typer.Option(None, "--role"),
+    role_class: str = typer.Option(None, "--role-class"),
+    company_category: str = typer.Option(None, "--company-category"),
+    location: str = typer.Option(None, "--location"),
+    as_json: bool = typer.Option(False, "--json"),
+):
+    """Hybrid candidate retrieval: structural prefilter UNION keyword-overlap from the
+    intent, over capsule text columns + interaction topics. Returns the candidate POOL
+    — semantic ranking is the agent's job (it reads these capsules in-context)."""
+    client = get_client()
+    has_struct = any([status, tier, tag, affiliation, role, role_class,
+                      company_category, location])
+
+    pool: dict[str, dict] = {}
+
+    # 1) structural prefilter — any explicit flags
+    if has_struct:
+        q = client.table("contacts").select(CAPSULE_COLS)
+        q = apply_contact_filters(
+            q, status=status, tier=tier, tag=tag, affiliation=affiliation,
+            role=role, role_class=role_class,
+            company_category=company_category, location=location)
+        for c in q.limit(FIND_POOL_CAP).execute().data:
+            pool[c["id"]] = c
+
+    # 2) keyword-overlap prefilter from the intent string over capsule text columns
+    tokens = _intent_tokens(intent)
+    if tokens:
+        clauses = [f"{col}.ilike.*{tok}*" for tok in tokens for col in FIND_TEXT_COLS]
+        clauses += [f'{col}.cs.{{"{tok}"}}' for tok in tokens for col in FIND_ARRAY_COLS]
+        kw = (client.table("contacts").select(CAPSULE_COLS)
+              .or_(",".join(clauses))
+              .limit(FIND_POOL_CAP).execute().data)
+        for c in kw:
+            pool.setdefault(c["id"], c)
+
+        # topics live in interactions.summary — find contacts whose recent touchpoints
+        # mention an intent token, then pull their capsule rows.
+        topic_clauses = [f"summary.ilike.*{tok}*" for tok in tokens]
+        hit_ids = {r["contact_id"] for r in
+                   (client.table("interactions").select("contact_id")
+                    .or_(",".join(topic_clauses))
+                    .limit(FIND_POOL_CAP).execute().data)}
+        missing = [cid for cid in hit_ids if cid not in pool]
+        if missing:
+            extra = (client.table("contacts").select(CAPSULE_COLS)
+                     .in_("id", missing).execute().data)
+            for c in extra:
+                pool.setdefault(c["id"], c)
+
+    contacts = list(pool.values())
+    if len(contacts) > FIND_POOL_CAP:
+        err(f"find: candidate pool truncated to {FIND_POOL_CAP} "
+            f"(matched {len(contacts)}) — narrow with structured flags for full coverage")
+        contacts = contacts[:FIND_POOL_CAP]
+
+    caps = _build_capsules(client, contacts)
+    out = {"intent": intent, "candidates": caps}
+    if as_json:
+        typer.echo(json.dumps(out, default=str))
+    else:
+        typer.echo(f"intent: {intent}  ({len(caps)} candidates)")
         for cap in caps:
             typer.echo(json.dumps(cap, default=str))

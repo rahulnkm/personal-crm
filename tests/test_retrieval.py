@@ -164,3 +164,52 @@ def test_capsules_empty_is_exit_zero_empty_json(db):
     r = runner.invoke(app, ["capsules", "--company-category", "nope", "--json"])
     assert r.exit_code == 0, r.output
     assert json.loads(r.output) == []
+
+
+# ----- Task 15: crm find -----
+
+def test_find_returns_intent_and_candidates_shape(db):
+    _seed(db)
+    r = runner.invoke(app, ["find", "cybersecurity founder", "--json"])
+    assert r.exit_code == 0, r.output
+    out = json.loads(r.output)
+    assert out["intent"] == "cybersecurity founder"
+    assert isinstance(out["candidates"], list)
+    # candidates are capsules
+    assert all("name" in c and "topics" in c for c in out["candidates"])
+
+
+def test_find_keyword_overlap_on_capsule_text(db):
+    _seed(db)
+    # "cybersecurity" only matches Ada via company_category; intent has no flags
+    r = runner.invoke(app, ["find", "someone in cybersecurity", "--json"])
+    assert r.exit_code == 0, r.output
+    names = {c["name"] for c in json.loads(r.output)["candidates"]}
+    assert "Ada Founder" in names
+    assert "Cleo Chief" not in names  # fintech, no keyword overlap
+
+
+def test_find_keyword_matches_notes(db):
+    db.table("contacts").insert(
+        {"full_name": "Note Nan", "notes": "Deep expertise in quantum cryptography.",
+         "connection_status": "contact_on_file", "closeness_tier": "none"}).execute()
+    r = runner.invoke(app, ["find", "quantum cryptography expert", "--json"])
+    assert r.exit_code == 0, r.output
+    names = {c["name"] for c in json.loads(r.output)["candidates"]}
+    assert "Note Nan" in names
+
+
+def test_find_union_structural_and_keyword(db):
+    by = _seed(db)
+    # --role founder catches Ada; keyword "fintech" catches Cleo via company_category
+    r = runner.invoke(app, ["find", "fintech leader", "--role", "founder", "--json"])
+    assert r.exit_code == 0, r.output
+    names = {c["name"] for c in json.loads(r.output)["candidates"]}
+    assert {"Ada Founder", "Cleo Chief"} <= names
+
+
+def test_find_no_match_empty_candidates(db):
+    _seed(db)
+    r = runner.invoke(app, ["find", "underwater basketweaving zzzzqqq", "--json"])
+    assert r.exit_code == 0, r.output
+    assert json.loads(r.output)["candidates"] == []
