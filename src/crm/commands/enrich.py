@@ -72,15 +72,22 @@ def review(
     approve: str = typer.Option(None, "--approve", help="Review id to accept"),
     reject: str = typer.Option(None, "--reject", help="Review id to reject (tombstone)"),
     skip: str = typer.Option(None, "--skip", help="Review id to skip"),
+    approve_identity: str = typer.Option(
+        None, "--approve-identity", help="candidate_identities id to promote to a live identity"),
     agent: str = typer.Option("rahul", "--agent"),
     as_json: bool = typer.Option(False, "--json"),
 ):
     """Arbitrate the enrichment review queue. Bare command lists open items."""
     client = get_client()
-    actions = [a for a in (approve, reject, skip) if a]
+    actions = [a for a in (approve, reject, skip, approve_identity) if a]
     if len(actions) > 1:
-        err("Pass only one of --approve / --reject / --skip")
+        err("Pass only one of --approve / --reject / --skip / --approve-identity")
         raise typer.Exit(2)
+
+    if approve_identity:
+        require_agent(client, agent)
+        _promote_identity(client, approve_identity, agent)
+        return
 
     if not actions:  # list open items
         rows = (client.table("enrich_review")
@@ -125,12 +132,97 @@ def review(
         typer.echo(f"skipped: {review_id}")
 
 
+def _promote_identity(client, candidate_id: str, agent: str) -> None:
+    """Promote a quarantined identifier into a live contact_identities match key.
+
+    Idempotent: the (source, source_external_id) unique index makes a re-promote
+    a no-op rather than a duplicate.
+    """
+    import hashlib
+
+    rows = client.table("candidate_identities").select("*").eq("id", candidate_id).execute().data
+    if not rows:
+        err(f"No candidate identity '{candidate_id}'")
+        raise typer.Exit(1)
+    ci = rows[0]
+    # map the identifier kind onto the contact_identities column
+    col = {"email": "email", "phone": "phone", "linkedin_url": "linkedin_url",
+           "handle": "handle"}.get(ci["kind"])
+    if col is None:
+        err(f"Unknown identifier kind '{ci['kind']}'")
+        raise typer.Exit(1)
+    source = f"enrich:{ci['source']}"
+    sxid = hashlib.sha256(ci["value"].encode()).hexdigest()
+    # idempotent insert: the (source, source_external_id) unique index is partial
+    # (source_external_id not null) so it can't drive ON CONFLICT inference —
+    # guard with an existence check instead.
+    exists = (client.table("contact_identities").select("id")
+              .eq("source", source).eq("source_external_id", sxid).execute().data)
+    if not exists:
+        client.table("contact_identities").insert({
+            "contact_id": ci["contact_id"], "source": source,
+            "source_external_id": sxid, col: ci["value"],
+        }).execute()
+    client.table("candidate_identities").update(
+        {"status": "promoted"}).eq("id", candidate_id).execute()
+    typer.echo(f"promoted: {ci['kind']} = {ci['value']}")
+
+
 def _method_for(agent: str) -> str:
     """Agent-authored enrichment is a derived method (never manual_set)."""
     return "enrich_agent"
 
 
+def _normalize_identifier(field: str, value: str | None) -> str | None:
+    from crm import normalize
+    fn = {
+        "email": normalize.normalize_email,
+        "linkedin_url": normalize.normalize_linkedin,
+        "phone": normalize.normalize_phone,
+    }.get(field)
+    if fn is None:  # handle (or anything else) — keep verbatim, lowercased
+        return value.strip().lower() if value else None
+    return fn(value)
+
+
 def _apply_identifier(client, contact: dict, cand: EnrichCandidate, agent: str,
                       dry_run: bool) -> str:
-    """Identifier routing → candidate_identities. Filled in Task 9."""
-    raise NotImplementedError("identifier routing lands in Task 9")
+    """Route a discovered identifier through the no-duplicate-manufacturing branch.
+
+    0 matches      → quarantine in candidate_identities (pending).
+    1 match, self  → noop (we already know this identity).
+    1 match, other → enrich_review (identifier_conflict) — never silently merge.
+    >=2 matches    → conflicting keys → enrich_review (identifier_conflict).
+    """
+    from crm.matching import find_candidates
+
+    norm = _normalize_identifier(cand.field, cand.value)
+    if not norm:
+        return "noop"
+
+    # pass identifier-only dict (no full_name) to suppress the fuzzy-name fallback
+    hit = find_candidates(client, {cand.field: norm})
+
+    if hit is None:  # 0 matches
+        if dry_run:
+            return "quarantine"
+        client.table("candidate_identities").upsert({
+            "contact_id": contact["id"], "kind": cand.field, "value": norm,
+            "source": cand.source or agent, "confidence": cand.confidence,
+            "source_detail": cand.source_detail, "status": "pending",
+        }, on_conflict="contact_id,kind,value").execute()
+        return "quarantine"
+
+    if hit["contact_id"] == contact["id"] and hit.get("score") == 1.0:
+        return "noop"  # single exact hit on this very contact
+
+    # exact hit on a different contact, or conflicting/ambiguous keys → human review
+    if dry_run:
+        return "review"
+    other = hit["contact_id"] if hit["contact_id"] != contact["id"] else None
+    client.table("enrich_review").insert({
+        "contact_id": contact["id"], "field": cand.field, "candidate_value": norm,
+        "source": cand.source or agent, "confidence": cand.confidence,
+        "reason": "identifier_conflict", "other_contact_id": other,
+    }).execute()
+    return "review"
