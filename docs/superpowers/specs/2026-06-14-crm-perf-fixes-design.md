@@ -4,7 +4,7 @@
 **Status:** Approved for planning (revised after 2nd adversarial review)
 **Companion spec:** `2026-06-14-crm-bulk-edit-design.md`
 **Sequencing:** this spec lands FIRST — it creates migration `0006` and the shared
-`_bump_last_touchpoint_bulk` helper that the bulk-edit spec consumes. Bulk-edit adds migration `0008` (no shared file → safe). NOTE: a `0007_recompute_clear_empty.sql` was added during impl to make recompute null abandoned contacts (denorm heal).
+`_bump_last_touchpoint_bulk` helper that the bulk-edit spec consumes. Bulk-edit adds migration `0009` (no shared file → safe). NOTE: a `0007_recompute_clear_empty.sql` was added during impl to make recompute null abandoned contacts (denorm heal).
 
 ## Problem
 
