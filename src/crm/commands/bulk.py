@@ -70,3 +70,44 @@ def bulk_set(
 
     # changed == cohort for set (every matched row is written)
     _emit(ids, len(ids), dry_run=False, as_json=as_json)
+
+
+@bulk_app.command("tag")
+def bulk_tag(
+    tag: str = typer.Argument(..., help="Tag to add (must already be in tag_registry)"),
+    status: str = typer.Option(None, "--status"),
+    tier: str = typer.Option(None, "--tier"),
+    tag_filter: str = typer.Option(None, "--tag", help="Filter cohort by existing tag"),
+    affiliation: str = typer.Option(None, "--affiliation"),
+    cold_since: int = typer.Option(None, "--cold-since",
+                                   help="Months since last touchpoint (or never)"),
+    all_: bool = typer.Option(False, "--all", help="Act on every contact (no filter)"),
+    dry_run: bool = typer.Option(False, "--dry-run", help="Preview without writing"),
+    yes: bool = typer.Option(False, "--yes", help="Required to apply a write"),
+    as_json: bool = typer.Option(False, "--json"),
+    agent: str = typer.Option("rahul", "--agent"),
+):
+    """Add a tag to every contact in the cohort. Tag must exist in the registry."""
+    client = get_client()
+
+    # Registry check: fail fast with a clear message before gate/cohort resolution.
+    rows = client.table("tag_registry").select("tag").eq("tag", tag).execute().data
+    if not rows:
+        err(f"Tag '{tag}' not in registry. First: crm tags add {tag} --desc '...'")
+        raise typer.Exit(1)
+
+    ids = _gate(client, status=status, tier=tier, tag=tag_filter,
+                affiliation=affiliation, cold_since=cold_since,
+                all_=all_, dry_run=dry_run, yes=yes, as_json=as_json, agent=agent)
+    if ids is None:  # gate already emitted (dry-run preview / empty cohort) or raised
+        return
+
+    affected: list[str] = []
+    for i in range(0, len(ids), CHUNK):
+        chunk = ids[i:i + CHUNK]
+        result = client.rpc("bulk_add_tag", {"p_tag": tag, "p_ids": chunk}).execute().data
+        for r in (result or []):
+            affected.append(r["bulk_add_tag"] if isinstance(r, dict) else r)
+
+    # cohort_count = len(ids) (all matched); changed_count = len(affected) (newly tagged)
+    _emit(affected, len(ids), dry_run=False, as_json=as_json)
