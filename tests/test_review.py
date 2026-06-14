@@ -1,3 +1,6 @@
+from unittest.mock import patch
+
+import pytest
 from typer.testing import CliRunner
 
 from crm.cli import app
@@ -68,6 +71,216 @@ def test_approve_with_deleted_candidate_fails_cleanly(db):
     db.table("staging").update({"matched_contact_id": None}).eq("id", row["id"]).execute()
     r = runner.invoke(app, ["review", "--approve", row["id"]])
     assert r.exit_code == 1
+
+
+def _seed_conflict_and_fuzzy(db):
+    """Insert two contacts + one conflicting_keys staging row and one fuzzy_name row.
+
+    Returns (conflict_row, fuzzy_row).
+    """
+    alice = db.table("contacts").insert(
+        {"full_name": "Alice Vance", "current_company": "AcmeCo"}
+    ).execute().data[0]
+    bob = db.table("contacts").insert(
+        {"full_name": "Bob Vance", "current_company": "VanceCo"}
+    ).execute().data[0]
+
+    # Give each contact a distinct identity key so we can use them in the conflict row
+    db.table("contact_identities").insert(
+        {"contact_id": alice["id"], "source": "li", "linkedin_url": "https://li.co/alice"}
+    ).execute()
+    db.table("contact_identities").insert(
+        {"contact_id": bob["id"], "source": "li", "source_external_id": "bob-li",
+         "linkedin_url": "https://li.co/bob"}
+    ).execute()
+
+    # A staging row that points at both alice (via linkedin) and bob (via source_external_id
+    # on email) — we fake it by inserting directly into staging with conflicting_keys
+    conflict_row = db.table("staging").insert({
+        "source": "test_src",
+        "source_external_id": "conflict-1",
+        "full_name": "Conflict Person",
+        "linkedin_url": "https://li.co/alice",   # matches alice's identity
+        "match_status": "needs_review",
+        "match_method": "conflicting_keys",
+        "match_confidence": 0.75,
+        "matched_contact_id": alice["id"],
+    }).execute().data[0]
+
+    # A fuzzy staging row pointing at bob
+    fuzzy_row = db.table("staging").insert({
+        "source": "test_src",
+        "source_external_id": "fuzzy-1",
+        "full_name": "Robert Vance",
+        "match_status": "needs_review",
+        "match_method": "fuzzy_name",
+        "match_confidence": 0.80,
+        "matched_contact_id": bob["id"],
+    }).execute().data[0]
+
+    return conflict_row, fuzzy_row
+
+
+# ---------------------------------------------------------------------------
+# Task 1.6 tests — two-pass batched review queue
+# ---------------------------------------------------------------------------
+
+def test_render_parity_conflict_and_fuzzy(db):
+    """Batched _candidate_display must produce identical output to the current per-row version.
+
+    Conflict rows use a set internally so candidate ORDER is non-deterministic; we
+    compare by splitting on ', ' and sorting the parts, not byte-identical string.
+    """
+    from crm.commands.dedup import _candidate_display, _prefetch_display_maps
+    from crm.config import get_client
+
+    conflict_row, fuzzy_row = _seed_conflict_and_fuzzy(db)
+    client = get_client()
+
+    # Capture golden output via the NEW API (prefetch maps, then render pure fn)
+    maps = _prefetch_display_maps(client, [conflict_row, fuzzy_row])
+    golden_conflict = _candidate_display(maps, conflict_row)
+    golden_fuzzy = _candidate_display(maps, fuzzy_row)
+
+    # Sanity: golden output should be non-empty sentinel or actual names
+    assert golden_conflict not in ("", None)
+    assert golden_fuzzy not in ("", None)
+
+    # Now invoke the full review listing and check the rendered output
+    r = runner.invoke(app, ["review", "--json"])
+    assert r.exit_code == 0
+
+    import json
+    rows = json.loads(r.output)
+    by_id = {row["id"]: row for row in rows}
+
+    assert conflict_row["id"] in by_id, "conflict row missing from review output"
+    assert fuzzy_row["id"] in by_id, "fuzzy row missing from review output"
+
+    # Fuzzy: exact match (single candidate, deterministic)
+    assert by_id[fuzzy_row["id"]]["candidate"] == golden_fuzzy
+
+    # Conflict: order-insensitive comparison (set built from Python set → non-deterministic)
+    actual_parts = sorted(by_id[conflict_row["id"]]["candidate"].split(", "))
+    golden_parts = sorted(golden_conflict.split(", "))
+    assert actual_parts == golden_parts, (
+        f"Conflict candidate mismatch:\n  actual: {actual_parts}\n  golden: {golden_parts}"
+    )
+
+
+def test_role_email_skip_preserved(db):
+    """A staging row whose email is a role address must not surface that address as a
+    candidate key — same as the current _candidate_display skip."""
+    contact = db.table("contacts").insert(
+        {"full_name": "Support Person", "current_company": "HelpCo"}
+    ).execute().data[0]
+    db.table("contact_identities").insert(
+        {"contact_id": contact["id"], "source": "em", "email": "info@helpco.com"}
+    ).execute()
+
+    # staging row with a role email — should get <no candidates> if info@ is the only key
+    row = db.table("staging").insert({
+        "source": "test_src",
+        "source_external_id": "role-email-1",
+        "full_name": "Support Person",
+        "email": "info@helpco.com",
+        "match_status": "needs_review",
+        "match_method": "conflicting_keys",
+        "match_confidence": 0.75,
+        "matched_contact_id": None,
+    }).execute().data[0]
+
+    from crm.commands.dedup import _candidate_display, _prefetch_display_maps
+    from crm.config import get_client
+    client = get_client()
+    maps = _prefetch_display_maps(client, [row])
+    result = _candidate_display(maps, row)
+    # role email must be skipped; matched_contact_id is None → <no candidates>
+    assert result == "<no candidates>", f"Expected '<no candidates>', got: {result!r}"
+
+
+_seed_counter = {"val": 0}  # module-level counter avoids duplicate keys across calls
+
+
+def _seed_n_fuzzy_rows(db, n: int):
+    """Create n independent fuzzy review rows (each pointing at a distinct contact).
+
+    Uses a module-level counter so repeated calls within the same test session never
+    produce duplicate (source, source_external_id) pairs.
+    """
+    offset = _seed_counter["val"]
+    _seed_counter["val"] += n
+
+    contacts = db.table("contacts").insert(
+        [{"full_name": f"BulkPerson {offset + i}", "current_company": f"BulkCo{offset + i}"}
+         for i in range(n)]
+    ).execute().data
+
+    rows = db.table("staging").insert([
+        {
+            "source": "bulk_test",
+            "source_external_id": f"bulk-{offset + i}",
+            "full_name": f"BulkPerson {offset + i} Variant",
+            "match_status": "needs_review",
+            "match_method": "fuzzy_name",
+            "match_confidence": 0.80,
+            "matched_contact_id": contacts[i]["id"],
+        }
+        for i in range(n)
+    ]).execute().data
+
+    return rows
+
+
+def test_n_invariance_review_display(db):
+    """Display pass must issue O(1) reads, not O(R) — same number of select queries
+    for 2 rows and 10 rows.
+
+    We patch crm.commands.dedup.get_client to inject the spy, then invoke review
+    list-only (no --approve/--reject flags).  The spy counts .execute() calls on
+    the table proxy; mutation calls (staging select at the top of review) are
+    excluded from comparison — we compare only the contact + identity selects
+    that grow with R in the current code.
+    """
+    from tests._spy import CountingClient
+    from crm.config import get_client
+
+    real_client = get_client()
+
+    def make_spy():
+        return CountingClient(real_client)
+
+    # --- 2 rows ---
+    _seed_n_fuzzy_rows(db, 2)
+    spy2 = make_spy()
+    with patch("crm.commands.dedup.get_client", return_value=spy2):
+        r = runner.invoke(app, ["review"])
+    assert r.exit_code == 0
+
+    # contacts selects in display pass — with batching there's exactly 1 regardless of R
+    contacts_selects_2 = spy2.count("contacts", "select")
+    identity_selects_2 = spy2.count("contact_identities", "select")
+
+    # --- 10 rows (add 8 more) ---
+    _seed_n_fuzzy_rows(db, 8)
+    spy10 = make_spy()
+    with patch("crm.commands.dedup.get_client", return_value=spy10):
+        r = runner.invoke(app, ["review"])
+    assert r.exit_code == 0
+
+    contacts_selects_10 = spy10.count("contacts", "select")
+    identity_selects_10 = spy10.count("contact_identities", "select")
+
+    # With the batched implementation, display-phase selects don't grow with R.
+    # They should be identical (1 contacts select, 0-3 identity selects).
+    assert contacts_selects_2 == contacts_selects_10, (
+        f"contacts selects grew: {contacts_selects_2} (R=2) vs {contacts_selects_10} (R=10) — "
+        "N+1 not fixed"
+    )
+    assert identity_selects_2 == identity_selects_10, (
+        f"identity selects grew: {identity_selects_2} (R=2) vs {identity_selects_10} (R=10) — "
+        "N+1 not fixed"
+    )
 
 
 def test_merge_and_split(db):

@@ -295,18 +295,28 @@ def dedup(workers: int = typer.Option(4, "--workers", help="Parallel workers (1-
         raise typer.Exit(1)
 
 
-def _candidate_display(client, q: dict) -> str:
+def _candidate_display(maps: dict, q: dict) -> str:
     """Return a human-readable candidate string for a review queue row.
 
+    Pure function over prefetched maps — no DB calls.
+
+    maps keys:
+      "contacts": {contact_id: {"full_name": ..., "current_company": ...}}
+      "identities": {field: {value: [contact_id, ...]}}
+        where field in ("email", "linkedin_url", "phone")
+
     For conflicting_keys / rerun_conflict: re-derive ALL distinct contact_ids
-    by querying contact_identities for every key the staged row has, then
+    from the prefetched identity maps for every key the staged row has, then
     render them as "Name (Co), Name2 (Co2)".
     For fuzzy_name: single lookup of matched_contact_id → "Name (Co or ?)".
     Handles missing/deleted contacts gracefully with "<gone>".
     """
+    contact_map: dict = maps["contacts"]
+    identity_map: dict = maps["identities"]
+
     conflict_methods = ("conflicting_keys", "rerun_conflict")
     if q.get("match_method") in conflict_methods:
-        # Re-derive all candidates from the staged row's identity keys
+        # Re-derive all candidates from the staged row's identity keys (in-memory)
         candidate_ids: set[str] = set()
         for field in ("email", "linkedin_url", "phone"):
             val = q.get(field)
@@ -314,12 +324,8 @@ def _candidate_display(client, q: dict) -> str:
                 continue
             if field == "email" and _is_role_email(val):
                 continue
-            rows = (client.table("contact_identities")
-                    .select("contact_id")
-                    .eq(field, val)
-                    .execute().data)
-            for r in rows:
-                candidate_ids.add(r["contact_id"])
+            for cid in identity_map.get(field, {}).get(val, []):
+                candidate_ids.add(cid)
         # Also include the stored matched_contact_id if present
         if q.get("matched_contact_id"):
             candidate_ids.add(q["matched_contact_id"])
@@ -327,13 +333,10 @@ def _candidate_display(client, q: dict) -> str:
             return "<no candidates>"
         parts = []
         for cid in candidate_ids:
-            contacts = (client.table("contacts")
-                        .select("full_name,current_company")
-                        .eq("id", cid).execute().data)
-            if not contacts:
+            if cid not in contact_map:
                 parts.append("<gone>")
             else:
-                c = contacts[0]
+                c = contact_map[cid]
                 co = c.get("current_company") or "?"
                 parts.append(f"{c['full_name']} ({co})")
         return ", ".join(parts)
@@ -342,14 +345,83 @@ def _candidate_display(client, q: dict) -> str:
         cid = q.get("matched_contact_id")
         if not cid:
             return "<none>"
-        contacts = (client.table("contacts")
-                    .select("full_name,current_company")
-                    .eq("id", cid).execute().data)
-        if not contacts:
+        if cid not in contact_map:
             return "<gone>"
-        c = contacts[0]
+        c = contact_map[cid]
         co = c.get("current_company") or "?"
         return f"{c['full_name']} ({co})"
+
+
+def _prefetch_display_maps(client, queue: list[dict]) -> dict:
+    """Pass 1: collect all ids/values needed by _candidate_display, issue batched reads.
+
+    Returns maps dict consumed by _candidate_display:
+      {
+        "contacts":   {contact_id: {full_name, current_company}},
+        "identities": {field: {value: [contact_id, ...]}},
+      }
+    """
+    conflict_methods = ("conflicting_keys", "rerun_conflict")
+
+    # Collect all contact_ids to fetch (from matched_contact_id on every row)
+    contact_ids: set[str] = set()
+    # Collect per-field values to look up in contact_identities
+    field_values: dict[str, set[str]] = {"email": set(), "linkedin_url": set(), "phone": set()}
+
+    for q in queue:
+        if q.get("matched_contact_id"):
+            contact_ids.add(q["matched_contact_id"])
+        if q.get("match_method") in conflict_methods:
+            for field in ("email", "linkedin_url", "phone"):
+                val = q.get(field)
+                if not val:
+                    continue
+                if field == "email" and _is_role_email(val):
+                    continue
+                field_values[field].add(val)
+
+    # Batched contacts fetch
+    contact_map: dict[str, dict] = {}
+    all_ids = sorted(contact_ids)
+    if all_ids:
+        rows = (client.table("contacts")
+                .select("id,full_name,current_company")
+                .in_("id", all_ids)
+                .execute().data)
+        for c in rows:
+            contact_map[c["id"]] = c
+
+    # Batched identity fetches (one query per field that has values)
+    identity_map: dict[str, dict[str, list[str]]] = {
+        "email": {}, "linkedin_url": {}, "phone": {}
+    }
+    for field, values in field_values.items():
+        if not values:
+            continue
+        rows = (client.table("contact_identities")
+                .select(f"contact_id,{field}")
+                .in_(field, sorted(values))
+                .execute().data)
+        for r in rows:
+            val = r[field]
+            cid = r["contact_id"]
+            identity_map[field].setdefault(val, []).append(cid)
+            # Also add these contact_ids to the contact fetch set if not already fetched
+            if cid not in contact_map:
+                contact_ids.add(cid)
+
+    # Second-pass contacts fetch for any contact_ids discovered via identity lookups
+    # (conflict rows may reference contacts not stored in matched_contact_id)
+    newly_discovered = [cid for cid in contact_ids if cid not in contact_map]
+    if newly_discovered:
+        rows = (client.table("contacts")
+                .select("id,full_name,current_company")
+                .in_("id", sorted(newly_discovered))
+                .execute().data)
+        for c in rows:
+            contact_map[c["id"]] = c
+
+    return {"contacts": contact_map, "identities": identity_map}
 
 
 def review(
@@ -412,8 +484,11 @@ def review(
         "match_confidence,match_method,matched_contact_id")
         .eq("match_status", "needs_review")
         .order("match_confidence", desc=True).execute().data)
+    # Pass 1: batched prefetch — one contacts select, ≤3 identity selects
+    maps = _prefetch_display_maps(client, queue)
+    # Pass 2: render from in-memory maps (no DB calls)
     for q in queue:
-        q["candidate"] = _candidate_display(client, q)
+        q["candidate"] = _candidate_display(maps, q)
     render(queue, as_json)
     if queue and not as_json:
         typer.echo("\nResolve: crm review --approve <id> | crm review --reject <id>")
