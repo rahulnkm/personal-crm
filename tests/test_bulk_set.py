@@ -62,11 +62,12 @@ def test_happy_path_updates_and_logs_chunked(db):
     ids = {r["id"] for r in rows}
 
     spy = CountingClient(db)
-    # commands.bulk does `from crm.bulk import CHUNK`, so the name to patch is the
-    # copy bound in commands.bulk (not crm.bulk) — that's the one the loop reads.
+    # bulk_set's read+update use .in_() (URL), so the loop chunks by URL_CHUNK.
+    # commands.bulk does `from crm.bulk import URL_CHUNK`, so patch the copy bound
+    # in commands.bulk (the one the loop reads).
     import crm.commands.bulk as bulk_cmd
     with patch("crm.commands.bulk.get_client", return_value=spy), \
-            patch.object(bulk_cmd, "CHUNK", 2):
+            patch.object(bulk_cmd, "URL_CHUNK", 2):
         r = runner.invoke(app, ["bulk", "set", "closeness_tier=t2_dm",
                                 "--status", "in_network", "--yes", "--agent", "rahul"])
     assert r.exit_code == 0, r.output

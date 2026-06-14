@@ -1,9 +1,12 @@
 """Shared helpers + constants for cohort-wide bulk operations (crm bulk *).
 
-`CHUNK` bounds write batches (per-statement payloads / `.in_()` URL length) and
-`PAGE` bounds cohort-read pagination. Both are module constants so tests can
-monkeypatch them to small values for fast boundary coverage. `PAGE` here is
-independent of `backfill.PAGE`.
+`CHUNK` bounds body-carried write batches (RPC `jsonb`/array payloads and
+`.insert([...])` bodies — these travel in the request body, so 500 is safe).
+`URL_CHUNK` bounds `.in_("id", ...)` filters that travel in the request URL —
+matching backfill's vetted ceiling (100 ids ≈ 4 KB) so a large cohort can't blow
+the URL length. `PAGE` bounds cohort-read pagination. All are module constants so
+tests can monkeypatch them small for fast boundary coverage; `PAGE`/`URL_CHUNK`
+here are independent of `backfill.PAGE`.
 """
 import json
 from datetime import date, timedelta
@@ -11,6 +14,7 @@ from datetime import date, timedelta
 import typer
 
 CHUNK = 500
+URL_CHUNK = 100
 PAGE = 1000
 
 
@@ -69,9 +73,12 @@ def _emit(affected_ids: list[str], cohort_count: int, dry_run: bool,
     Human paths emit readable text — sample lines on dry-run, a tally on write.
 
     Args:
-        affected_ids:  The full list of ids in the cohort (or that were changed).
-        cohort_count:  Total contacts that matched the filter (= len(affected_ids)
-                       unless the caller already knows a separate cohort size).
+        affected_ids:  The ids that were (or would be) CHANGED. For set/log this
+                       equals the cohort; for tag it's only the newly-tagged subset
+                       (already-tagged contacts are excluded). `changed_count` is
+                       reported as len(affected_ids) on the write path.
+        cohort_count:  Total contacts that matched the filter (may be > len(
+                       affected_ids), e.g. tag where some already had the tag).
         dry_run:       True → preview mode (no writes happened).
         as_json:       True → emit machine-readable JSON on stdout.
         sample_names:  List of {"id": ..., "full_name": ...} dicts for the human

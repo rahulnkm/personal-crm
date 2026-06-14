@@ -10,7 +10,7 @@ from datetime import date as date_t
 
 import typer
 
-from crm.bulk import CHUNK, _emit, _gate
+from crm.bulk import CHUNK, URL_CHUNK, _emit, _gate
 from crm.commands.contacts import ARRAY_FIELDS, ENUM_VALUES, SETTABLE
 from crm.commands.log import VALID_KINDS, _bump_last_touchpoint_bulk, _validate_iso_date
 from crm.config import get_client
@@ -56,8 +56,10 @@ def bulk_set(
     if ids is None:  # gate already emitted (dry-run preview / empty cohort) or raised
         return
 
-    for i in range(0, len(ids), CHUNK):
-        chunk = ids[i:i + CHUNK]
+    # bulk_set's read + update use .in_("id", ...) which travels in the URL, so
+    # chunk by URL_CHUNK (not CHUNK) to stay under the URL-length ceiling.
+    for i in range(0, len(ids), URL_CHUNK):
+        chunk = ids[i:i + URL_CHUNK]
         # capture pre-write values so the audit log records the real old_value
         before = (client.table("contacts").select("id," + field)
                   .in_("id", chunk).execute().data)
