@@ -34,3 +34,4 @@ testpaths = ["tests"]
 [tool.coverage.run]
 source = ["crm"]
 branch = true
+omit = ["tests/*", "scripts/*"]
