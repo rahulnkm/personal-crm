@@ -33,9 +33,10 @@ This spec extends that pattern; it does not invent a new one.
   `insert … select from jsonb_to_recordset(...) on conflict (cols) where <predicate> do update set …`.
 - **Same value across the whole set** → no RPC needed; PostgREST
   `.update(payload).in_("id", ids)` is already one round-trip.
-- Every new function: `set search_path = public`, `grant execute … to service_role`,
-  and callers chunk ≤ 500 rows/call to stay under the 8 s service-role statement
-  timeout (the existing `RECOMPUTE_CHUNK = 500` pattern).
+- Every new function: `set search_path = public, extensions` (matches every
+  existing function in the repo), `grant execute … to service_role`, and callers
+  chunk ≤ 500 rows/call to stay under the 8 s service-role statement timeout (the
+  existing `RECOMPUTE_CHUNK = 500` pattern).
 
 ## Scope — the six findings
 
@@ -136,6 +137,10 @@ key column (`email`/`linkedin_url`/`phone`) using `.in_()`. Build dicts. Pass 2
 renders each row from the in-memory maps. `_candidate_display` becomes a pure
 function over the prefetched maps (testable without a client).
 
+**Carry forward:** the current code skips role emails via `_is_role_email(val)`
+before the email-identity lookup (dedup.py:248). Pass 1 collection MUST apply the
+same filter, or the rewrite over-fetches and over-renders candidates.
+
 **Round-trips:** queue of R rows: O(R) → ~4 total.
 
 ### Finding 5 (MED) — stats 16 round-trips
@@ -146,7 +151,11 @@ buckets via `GROUP BY` over `contacts` (by `connection_status`, by
 `closeness_tier`), `staging` (by `match_status`), `staging_interactions`
 (by `match_status`), plus `contacts_total`. Python flattens it into the existing
 `out` list shape (so `--json` and table output are byte-for-byte compatible) and
-applies the same "drop zero rows except contacts_total" filter.
+applies the same "drop zero rows except contacts_total" filter. **Ordering is
+re-imposed in Python:** `GROUP BY` returns buckets unordered and omits zero
+counts, so the flattening iterates the SAME fixed status/tier/match_status lists
+the current code uses, filling missing buckets with 0 — this preserves the exact
+metric order.
 
 **Round-trips:** ~16 → 1.
 
@@ -173,7 +182,7 @@ Keep the existing `tri_of` memoization and union-find short-circuit.
 Shared with the bulk-edit spec. Functions added by THIS spec:
 `attach_and_fill(payload jsonb) returns table(...)`,
 `bulk_upsert_interactions(payload jsonb) returns void`,
-`crm_stats() returns jsonb`. Each: `set search_path = public`,
+`crm_stats() returns jsonb`. Each: `set search_path = public, extensions`,
 `grant execute … to service_role`. (The bulk-edit spec adds `bulk_add_tag` and
 `bulk_append_note` to the same migration.)
 

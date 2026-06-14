@@ -61,11 +61,17 @@ shared confirm/dry-run helper, and the chunked-RPC caller. Commands live in
 ## The four verbs
 
 ### `crm bulk set <field>=<value>`
-- Validate `field ∈ SETTABLE` and (if enum) `value ∈ ENUM_VALUES[field]` — reuse
-  `contacts.py` constants. Array fields (`tags`, `affiliations`): see `bulk tag`
-  for tags; for `affiliations` use the same array-append RPC shape.
-- Scalar field (e.g. `connection_status`, `closeness_tier`) → **same value across
-  the set**, so one `client.table("contacts").update({field:value,
+- **Scalar fields only.** Validate `field ∈ SETTABLE` AND `field ∉ ARRAY_FIELDS`;
+  reject array fields (`tags`, `affiliations`) with a usage error
+  (`"bulk set handles scalar fields; for tags use: crm bulk tag <tag> …"`),
+  exit 2. This keeps `bulk set` to a single clean code path and avoids a second
+  array-append RPC — `tags` already has the dedicated `bulk tag` verb, and bulk
+  `affiliations` append is explicitly deferred (YAGNI; add a `crm bulk affiliate`
+  verb later if needed).
+- If the field is an enum, validate `value ∈ ENUM_VALUES[field]` — reuse
+  `contacts.py` constants.
+- Scalar field → **same value across the set**, so one
+  `client.table("contacts").update({field:value,
   "updated_at":"now()"}).in_("id", ids).execute()` (one round-trip, no RPC).
 - One batched `enrichment_log.insert([...])` (method `'bulk_set'`, source=agent),
   chunked ≤ 500.
@@ -86,7 +92,9 @@ shared confirm/dry-run helper, and the chunked-RPC caller. Commands live in
   validate date.
 - One `interactions.insert([...])` for all contacts (chunked ≤ 500) + one bulk
   last-touchpoint bump using the shared `_bump_last_touchpoint_bulk` helper from
-  the perf spec (one `.in_()` read + one `.update().in_(ids_to_bump)`).
+  the perf spec (one `.in_()` read + one `.update().in_(ids_to_bump)`). The bump
+  writes `last_touchpoint_topic = summary` (mirrors single `crm log`, which passes
+  `summary` as the topic), `last_touchpoint_channel = channel`.
 - This is the "sent the newsletter / hosted a dinner" cohort touchpoint.
 
 ### `crm bulk note <text>`
@@ -113,7 +121,8 @@ Functions added by THIS spec: `bulk_add_tag(text, uuid[])`,
 - **Atomicity:** each RPC is one statement (atomic). The non-RPC `bulk set`
   (update + enrichment_log insert) is two calls; on failure of the log insert the
   update has already applied — acceptable (enrichment_log is an audit trail, not a
-  gate), documented in the command docstring.
+  gate), documented in the command docstring. This is **not a regression**:
+  single `set_field` already orders update-then-log the same way.
 - Exit codes follow the project: 0 ok, 1 error, 2 usage.
 
 ## Testing
