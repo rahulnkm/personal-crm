@@ -22,6 +22,39 @@ ENUM_VALUES = {
     "email_status": {"verified", "risky", "invalid", "unknown"},
 }
 
+# Role-token synonym expansion for --role / --role-class. Each token the caller
+# passes is matched as a case-insensitive substring; synonyms widen the net so
+# "founder" also catches "co-founder", "ceo" also catches "chief executive".
+ROLE_SYNONYMS = {
+    "founder": ["founder", "co-founder", "cofounder", "founding"],
+    "cofounder": ["founder", "co-founder", "cofounder", "founding"],
+    "co-founder": ["founder", "co-founder", "cofounder", "founding"],
+    "ceo": ["ceo", "chief executive"],
+}
+# --role-class <name> → a curated bundle of role tokens (a named persona filter).
+ROLE_CLASSES = {
+    "founder": ["founder", "co-founder", "cofounder", "founding"],
+}
+
+
+def _expand_role_tokens(tokens: list[str]) -> list[str]:
+    """Lower-case, dedupe, and synonym-expand a list of role search tokens."""
+    out: list[str] = []
+    for tok in tokens:
+        tok = tok.strip().lower()
+        if not tok:
+            continue
+        for syn in ROLE_SYNONYMS.get(tok, [tok]):
+            if syn not in out:
+                out.append(syn)
+    return out
+
+
+def _safe_ilike(term: str) -> str:
+    """Neutralize PostgREST or_() grammar chars so a term can't break/inject the
+    filter (mirrors the search command's sanitizer)."""
+    return re.sub(r'[,().*"%]', " ", term).strip()
+
 
 def _resolve(client, ref: str) -> dict:
     """Accept a uuid or a (unique) name; exit 1 with candidates if ambiguous."""
@@ -100,22 +133,25 @@ def _provenance_map(client, contact_id: str) -> dict:
     return out
 
 
-def list_contacts(
-    status: str = typer.Option(None, "--status"),
-    tier: str = typer.Option(None, "--tier"),
-    tag: str = typer.Option(None, "--tag"),
-    affiliation: str = typer.Option(None, "--affiliation"),
-    cold_since: int = typer.Option(None, "--cold-since",
-                                   help="Months since last touchpoint (or never)"),
-    limit: int = typer.Option(100, "--limit"),
-    as_json: bool = typer.Option(False, "--json"),
+def apply_contact_filters(
+    q,
+    *,
+    status: str = None,
+    tier: str = None,
+    tag: str = None,
+    affiliation: str = None,
+    cold_since: int = None,
+    role: str = None,
+    role_class: str = None,
+    company_category: str = None,
+    location: str = None,
 ):
-    """The reconnection query. Filters compose with AND."""
-    limit = min(limit, 1000)  # PostgREST response cap
-    client = get_client()
-    q = client.table("contacts").select(
-        "id,full_name,current_role,current_company,connection_status,"
-        "closeness_tier,affiliations,tags,last_touchpoint_at")
+    """Apply the shared structured filters to a PostgREST contacts query builder.
+
+    Returns the augmented builder so list/capsules/find share one filter grammar.
+    All filters compose with AND. --role/--role-class expand into a synonym-widened
+    OR of case-insensitive substring matches on current_role.
+    """
     if status:
         q = q.eq("connection_status", status)
     if tier:
@@ -127,6 +163,58 @@ def list_contacts(
     if cold_since is not None:
         cutoff = (date.today() - timedelta(days=30 * cold_since)).isoformat()
         q = q.or_(f"last_touchpoint_at.lte.{cutoff},last_touchpoint_at.is.null")
+    # role tokens (from --role and --role-class) — union into one synonym-expanded
+    # OR of substring matches; if any token is given but expands to nothing usable
+    # the filter is a no-op (caller passed only punctuation).
+    role_tokens: list[str] = []
+    if role:
+        role_tokens += role.split(",")
+    if role_class:
+        role_tokens += ROLE_CLASSES.get(role_class.strip().lower(), [role_class])
+    expanded = _expand_role_tokens(role_tokens)
+    safe_roles = [_safe_ilike(t) for t in expanded]
+    safe_roles = [t for t in safe_roles if t]
+    if safe_roles:
+        q = q.or_(",".join(f"current_role.ilike.*{t}*" for t in safe_roles))
+    if company_category:
+        cc = _safe_ilike(company_category)
+        if cc:
+            q = q.ilike("company_category", f"%{cc}%")
+    if location:
+        loc = _safe_ilike(location)
+        if loc:
+            q = q.ilike("location", f"%{loc}%")
+    return q
+
+
+def list_contacts(
+    status: str = typer.Option(None, "--status"),
+    tier: str = typer.Option(None, "--tier"),
+    tag: str = typer.Option(None, "--tag"),
+    affiliation: str = typer.Option(None, "--affiliation"),
+    role: str = typer.Option(None, "--role",
+                             help="Role substring(s), comma-separated; synonym-expanded "
+                                  "(founder→co-founder…, ceo→chief executive)"),
+    role_class: str = typer.Option(None, "--role-class",
+                                   help="Named role bundle, e.g. 'founder'"),
+    company_category: str = typer.Option(None, "--company-category",
+                                         help="Company category substring"),
+    location: str = typer.Option(None, "--location", help="Location substring"),
+    cold_since: int = typer.Option(None, "--cold-since",
+                                   help="Months since last touchpoint (or never)"),
+    limit: int = typer.Option(100, "--limit"),
+    as_json: bool = typer.Option(False, "--json"),
+):
+    """The reconnection query. Filters compose with AND."""
+    limit = min(limit, 1000)  # PostgREST response cap
+    client = get_client()
+    q = client.table("contacts").select(
+        "id,full_name,current_role,current_company,company_category,location,"
+        "connection_status,closeness_tier,affiliations,tags,last_touchpoint_at")
+    q = apply_contact_filters(
+        q, status=status, tier=tier, tag=tag, affiliation=affiliation,
+        cold_since=cold_since, role=role, role_class=role_class,
+        company_category=company_category, location=location)
     rows = q.order("last_touchpoint_at", desc=False, nullsfirst=True).limit(limit).execute().data
     render(rows, as_json)
 
