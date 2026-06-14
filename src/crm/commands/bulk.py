@@ -6,10 +6,13 @@ of ids to act on (or None as a STOP sentinel — it has already emitted the
 dry-run preview / empty-cohort tally). On the happy path the gate does NOT emit;
 the verb writes per CHUNK-sized slice and then emits the final tally itself.
 """
+from datetime import date as date_t
+
 import typer
 
 from crm.bulk import CHUNK, _emit, _gate
 from crm.commands.contacts import ARRAY_FIELDS, ENUM_VALUES, SETTABLE
+from crm.commands.log import VALID_KINDS, _bump_last_touchpoint_bulk, _validate_iso_date
 from crm.config import get_client
 from crm.output import err
 
@@ -111,3 +114,52 @@ def bulk_tag(
 
     # cohort_count = len(ids) (all matched); changed_count = len(affected) (newly tagged)
     _emit(affected, len(ids), dry_run=False, as_json=as_json)
+
+
+@bulk_app.command("log")
+def bulk_log(
+    kind: str = typer.Option(..., "--kind",
+                             help="origin|event|email|message|call|meeting"),
+    channel: str = typer.Option(None, "--channel"),
+    date: str = typer.Option(None, "--date", help="YYYY-MM-DD; default today"),
+    summary: str = typer.Option(None, "--summary"),
+    status: str = typer.Option(None, "--status"),
+    tier: str = typer.Option(None, "--tier"),
+    tag: str = typer.Option(None, "--tag", help="Filter cohort by tag"),
+    affiliation: str = typer.Option(None, "--affiliation"),
+    cold_since: int = typer.Option(None, "--cold-since",
+                                   help="Months since last touchpoint (or never)"),
+    all_: bool = typer.Option(False, "--all", help="Act on every contact (no filter)"),
+    dry_run: bool = typer.Option(False, "--dry-run", help="Preview without writing"),
+    yes: bool = typer.Option(False, "--yes", help="Required to apply a write"),
+    as_json: bool = typer.Option(False, "--json"),
+    agent: str = typer.Option("rahul", "--agent"),
+):
+    """Log a touchpoint against every contact in the cohort."""
+    if kind not in VALID_KINDS:
+        err(f"'{kind}' is not a valid kind. Valid: {sorted(VALID_KINDS)}")
+        raise typer.Exit(1)
+    _validate_iso_date(date)
+    occurred = date or date_t.today().isoformat()
+
+    client = get_client()
+    ids = _gate(client, status=status, tier=tier, tag=tag, affiliation=affiliation,
+                cold_since=cold_since, all_=all_, dry_run=dry_run, yes=yes,
+                as_json=as_json, agent=agent)
+    if ids is None:  # gate already emitted (dry-run preview / empty cohort) or raised
+        return
+
+    for i in range(0, len(ids), CHUNK):
+        chunk = ids[i:i + CHUNK]
+        client.table("interactions").insert([
+            {"contact_id": cid, "kind": kind, "channel": channel,
+             "occurred_at": occurred, "summary": summary, "logged_by": agent}
+            for cid in chunk
+        ]).execute()
+
+    # Monotonic bump of last_touchpoint_* fields; RPC is equal-date-safe and
+    # chunks internally, so we pass the full id list.
+    _bump_last_touchpoint_bulk(client, ids, occurred, channel, topic=summary)
+
+    # changed == cohort for log (every matched contact gets an interaction row)
+    _emit(ids, len(ids), dry_run=False, as_json=as_json)
