@@ -5,7 +5,7 @@
 **Companion spec:** `2026-06-14-crm-perf-fixes-design.md`
 **Sequencing:** implement AFTER the perf spec — it consumes the
 `_bump_last_touchpoint_bulk` helper that the perf spec creates. This spec adds its
-own migration `0007_bulk_edit_rpcs.sql` (separate file → no co-edit conflict with
+own migration `0008_bulk_edit_rpcs.sql` (separate file → no co-edit conflict with
 perf's `0006`).
 
 ## Problem
@@ -142,7 +142,7 @@ a lone UX divergence and an agent footgun). Instead: **a write requires `--yes`*
   skip, and the lost-update race are all handled server-side.
   `last_touchpoint_topic = summary` mirrors single `crm log`.
 
-## New SQL — migration `0007_bulk_edit_rpcs.sql`
+## New SQL — migration `0008_bulk_edit_rpcs.sql`
 Function: `bulk_add_tag(p_tag text, p_ids uuid[]) returns setof uuid`.
 `set search_path = public, extensions`, then `revoke execute … from public` AND
 `grant execute … to service_role`, with a `drop function if exists
@@ -153,7 +153,7 @@ index** — cohort filters hit existing `contacts_tags_gin` /
 
 ## Testing
 Local stack only; same infra as the perf spec (`pytest-cov` + `diff-cover` vs
-`main`; migration `0007` applied via `supabase db reset` preflight; behavioral DB
+`main`; migrations `0006`/`0007`/`0008` applied via `supabase db reset` preflight; behavioral DB
 tests for the RPC since plpgsql is invisible to coverage; the `get_client`-factory
 counting proxy from `tests/_spy.py`; monkeypatchable `PAGE`/`CHUNK`; bulk-seed big
 fixtures in one insert).

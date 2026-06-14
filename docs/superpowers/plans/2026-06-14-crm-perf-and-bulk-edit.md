@@ -4,7 +4,7 @@
 
 **Goal:** Eliminate six audited N+1 / perf issues in the `crm` CLI and add a `crm bulk set/tag/log` command family, with behavior preserved and 100% coverage on changed code.
 
-**Architecture:** Replace per-row DB round-trips with (a) client-side read-batching + Python folds where subtle logic must be preserved, (b) one bulk `.update().in_()` where the value is uniform, and (c) plpgsql RPCs only where PostgREST can't express the op (partial-index upsert; GROUP BY aggregate; atomic array-append). Two new migrations: `0006_perf_rpcs.sql`, `0007_bulk_edit_rpcs.sql`.
+**Architecture:** Replace per-row DB round-trips with (a) client-side read-batching + Python folds where subtle logic must be preserved, (b) one bulk `.update().in_()` where the value is uniform, and (c) plpgsql RPCs only where PostgREST can't express the op (partial-index upsert; GROUP BY aggregate; atomic array-append). Two new migrations: `0006_perf_rpcs.sql`, `0008_bulk_edit_rpcs.sql`.
 
 **Tech Stack:** Python 3 · Typer · supabase-py (PostgREST) · Postgres (Supabase, local stack) · pytest · pytest-cov + diff-cover · uv.
 
@@ -15,7 +15,7 @@
 **Global rules:**
 - TDD: failing test → run-fail → implement → run-pass → commit. One logical change per commit.
 - All tests run against the LOCAL Supabase stack only (`conftest.py` refuses non-local URLs).
-- **Preflight before any DB test run:** `supabase db reset` to apply migrations (incl. new 0006/0007). `conftest.py` only truncates data tables; it does not create schema.
+- **Preflight before any DB test run:** `supabase db reset` to apply migrations (incl. new 0006, 0007 recompute-heal, 0008). `conftest.py` only truncates data tables; it does not create schema.
 - plpgsql is invisible to coverage — every RPC branch is pinned by a **behavioral DB test** (seed → call → assert rows), following the existing `tests/test_dedup_rpcs.py` pattern.
 - Commit message convention: end with `Co-Authored-By: Claude Opus 4.8 <noreply@anthropic.com>`.
 
@@ -25,7 +25,7 @@
 
 **Create:**
 - `supabase/migrations/0006_perf_rpcs.sql` — `bulk_upsert_interactions`, `crm_stats`
-- `supabase/migrations/0007_bulk_edit_rpcs.sql` — `bulk_add_tag`
+- `supabase/migrations/0008_bulk_edit_rpcs.sql` — `bulk_add_tag`
 - `src/crm/bulk.py` — `CHUNK`/`PAGE` constants, `_resolve_cohort`, cohort gate/dry-run/json/confirm helpers, chunked-write helper
 - `src/crm/commands/bulk.py` — `bulk` Typer sub-app: `set`, `tag`, `log`
 - `tests/_spy.py` — chaining-aware counting proxy (`# pragma: no cover`)
@@ -491,7 +491,7 @@ for cid, upd in fills.items():
 
 ---
 
-## Phase 2 — Bulk-edit commands (lands migration 0007)
+## Phase 2 — Bulk-edit commands (lands migration 0008)
 
 ### Task 2.1: `src/crm/bulk.py` — constants + `_resolve_cohort`
 
@@ -513,9 +513,9 @@ for cid, upd in fills.items():
 - [ ] **Step 4: Run, verify pass.**
 - [ ] **Step 5: Commit.** `feat(bulk): cohort gate (dry-run / --yes / json, agent-validated)`.
 
-### Task 2.3: Migration 0007 — `bulk_add_tag`
+### Task 2.3: Migration 0008 — `bulk_add_tag`
 
-**Files:** Create `supabase/migrations/0007_bulk_edit_rpcs.sql`, `tests/test_bulk_tag.py` (RPC part).
+**Files:** Create `supabase/migrations/0008_bulk_edit_rpcs.sql`, `tests/test_bulk_tag.py` (RPC part).
 
 - [ ] **Step 1: Write behavioral test (failing).** Seed contacts (some already tagged); call RPC; assert idempotency (returns only newly-affected ids), sorted `tags` array, count = affected not cohort.
 - [ ] **Step 2: Run, verify fail.** `supabase db reset && uv run pytest tests/test_bulk_tag.py -v`.
@@ -541,7 +541,7 @@ Tests also: empty `p_ids` (`[]`) → returns `[]`, mutates nothing; a contact wi
 `tags = '{}'` (the default) gets `{p_tag}` (confirms the NOT-NULL default means no
 coalesce needed).
 - [ ] **Step 4: Apply + run, verify pass.** `supabase db reset && uv run pytest tests/test_bulk_tag.py -v`.
-- [ ] **Step 5: Commit.** `feat(db): bulk_add_tag RPC (0007)`.
+- [ ] **Step 5: Commit.** `feat(db): bulk_add_tag RPC (0008)`.
 
 ### Task 2.4: `crm bulk set` + register sub-app
 

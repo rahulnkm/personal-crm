@@ -4,8 +4,7 @@
 **Status:** Approved for planning (revised after 2nd adversarial review)
 **Companion spec:** `2026-06-14-crm-bulk-edit-design.md`
 **Sequencing:** this spec lands FIRST — it creates migration `0006` and the shared
-`_bump_last_touchpoint_bulk` helper that the bulk-edit spec consumes. Bulk-edit
-adds its own migration `0007` (no shared file → safe to implement after).
+`_bump_last_touchpoint_bulk` helper that the bulk-edit spec consumes. Bulk-edit adds migration `0008` (no shared file → safe). NOTE: a `0007_recompute_clear_empty.sql` was added during impl to make recompute null abandoned contacts (denorm heal).
 
 ## Problem
 
@@ -263,7 +262,7 @@ Local Supabase stack only (`conftest.py` fixture; refuses non-local URLs).
   is what `diff-cover` consumes). "100% on changed code" is enforced by
   `diff-cover coverage.xml --compare-branch=main --fail-under=100` (whole-repo
   100% is out of scope). Document both commands in the PR.
-- **Migration application:** the new RPCs require `0006` (and bulk-edit's `0007`)
+- **Migration application:** the new RPCs require `0006` (plus `0007` recompute-heal, and bulk-edit's `0008`)
   applied. Document a preflight: `supabase db reset` before the suite (or
   `supabase migration up`). `conftest.py` only truncates `DATA_TABLES`; add a note
   that migrations must be applied first. CI/local loop runs the reset once.
