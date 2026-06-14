@@ -239,3 +239,135 @@ def test_list_contacts_order_nullsfirst_characterization(db):
     assert null_idx < old_idx < mid_idx, (
         f"order wrong: null@{null_idx}, old@{old_idx}, mid@{mid_idx}"
     )
+
+
+# ── _gate / _emit: Task 2.2 ──────────────────────────────────────────────────
+
+def _gate_call(db, *, status=None, tier=None, tag=None, affiliation=None,
+               cold_since=None, all_=False, dry_run=False, yes=False,
+               as_json=False, agent="rahul"):
+    """Thin helper so individual tests only pass what they care about."""
+    from crm.bulk import _gate
+    return _gate(
+        db,
+        status=status, tier=tier, tag=tag, affiliation=affiliation,
+        cold_since=cold_since, all_=all_, dry_run=dry_run, yes=yes,
+        as_json=as_json, agent=agent,
+    )
+
+
+# ── guard-rail: no filter + not all_ ────────────────────────────────────────
+
+def test_gate_no_filter_no_all_exits(db):
+    """No filters + no --all must exit(2) with an error."""
+    import typer
+    with pytest.raises(typer.Exit) as exc_info:
+        _gate_call(db)
+    assert exc_info.value.exit_code == 2
+
+
+# ── guard-rail: --all + filter ────────────────────────────────────────────────
+
+def test_gate_all_with_filter_exits(db):
+    """--all combined with a filter must exit(2)."""
+    import typer
+    with pytest.raises(typer.Exit) as exc_info:
+        _gate_call(db, all_=True, status="in_network")
+    assert exc_info.value.exit_code == 2
+
+
+# ── guard-rail: not dry-run + not yes ────────────────────────────────────────
+
+def test_gate_write_without_yes_exits(db):
+    """A write path (not dry-run) without --yes must exit(2)."""
+    import typer
+    _seed(db, "Alice Write Guard", connection_status="in_network")
+    with pytest.raises(typer.Exit) as exc_info:
+        _gate_call(db, status="in_network", dry_run=False, yes=False)
+    assert exc_info.value.exit_code == 2
+
+
+# ── guard-rail: unregistered agent on write path ─────────────────────────────
+
+def test_gate_unregistered_agent_exits(db):
+    """An unregistered agent string on a write path must exit(1)."""
+    import typer
+    _seed(db, "Bob Agent Guard", connection_status="in_network")
+    with pytest.raises(typer.Exit) as exc_info:
+        _gate_call(db, status="in_network", yes=True, agent="ghost-agent-xyz")
+    assert exc_info.value.exit_code == 1
+
+
+# ── dry-run: bogus agent is NOT validated ────────────────────────────────────
+
+def test_gate_dry_run_skips_agent_validation(db, capsys):
+    """dry-run with a bogus agent must NOT raise, and must emit dry-run shape."""
+    _seed(db, "Carol Dry Run", connection_status="in_network")
+    result = _gate_call(db, status="in_network", dry_run=True, agent="totally-bogus-agent",
+                        as_json=True)
+    assert result is None  # STOP sentinel
+    captured = capsys.readouterr()
+    data = json.loads(captured.out.strip())
+    assert data["dry_run"] is True
+    assert data["cohort_count"] >= 1
+    assert isinstance(data["affected"], list)
+
+
+# ── dry-run + as_json: correct JSON shape ────────────────────────────────────
+
+def test_gate_dry_run_json_shape(db, capsys):
+    """dry-run + --json must emit {"dry_run": true, "cohort_count": N, "affected": [...]}."""
+    _seed(db, "Dave JSON Dry", connection_status="in_network")
+    result = _gate_call(db, status="in_network", dry_run=True, as_json=True)
+    assert result is None
+    data = json.loads(capsys.readouterr().out.strip())
+    assert data["dry_run"] is True
+    assert "cohort_count" in data
+    assert "affected" in data
+    assert "changed_count" not in data  # dry-run must NOT include changed_count
+
+
+# ── empty cohort on write path ───────────────────────────────────────────────
+
+def test_gate_empty_cohort_emits_zero_and_stops(db, capsys):
+    """A filter matching nothing must emit count 0 and return None (not the ids)."""
+    # seed nothing for this tag so the cohort is empty
+    result = _gate_call(db, status="in_network", yes=True, as_json=True)
+    assert result is None
+    data = json.loads(capsys.readouterr().out.strip())
+    assert data["dry_run"] is False
+    assert data["cohort_count"] == 0
+    assert data["affected"] == []
+    assert data["changed_count"] == 0
+
+
+# ── happy path: returns ids ───────────────────────────────────────────────────
+
+def test_gate_happy_path_returns_ids(db):
+    """A matching cohort on a write path (yes=True, valid agent) must return the ids."""
+    row = _seed(db, "Eve Happy", connection_status="in_network")
+    ids = _gate_call(db, status="in_network", yes=True, agent="rahul")
+    assert ids is not None
+    assert row["id"] in ids
+
+
+# ── spy: agent validated exactly once ────────────────────────────────────────
+
+def test_gate_agent_validated_exactly_once(db):
+    """require_agent must hit the agents table exactly once on a write path."""
+    from tests._spy import CountingClient
+    _seed(db, "Frank Spy", connection_status="in_network")
+    spy = CountingClient(db)
+    _gate_call(spy, status="in_network", yes=True, agent="rahul")
+    assert spy.count("agents", "select") == 1
+
+
+# ── human output: dry-run human-readable ─────────────────────────────────────
+
+def test_gate_dry_run_human_output(db, capsys):
+    """Human dry-run must print a 'would affect N contacts:' style line."""
+    _seed(db, "Grace Human Dry", connection_status="in_network")
+    result = _gate_call(db, status="in_network", dry_run=True, as_json=False)
+    assert result is None
+    out = capsys.readouterr().out
+    assert "would affect" in out
