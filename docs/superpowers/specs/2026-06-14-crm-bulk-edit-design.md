@@ -47,7 +47,8 @@ crm bulk log  --kind <k> [--channel --date --summary] [filters] [--all] [--dry-r
 - **`--dry-run`:** resolve the cohort, print count + sample (first ~10 full_names);
   with `--json`, emit `{"dry_run": true, "would_affect": [<ids>], "count": N}`.
   Writes nothing, exit 0. Dry-run does **not** require a registered `--agent`
-  (read-only preview).
+  (read-only preview) and **ignores `--yes`/`--agent`** (it never prompts or
+  writes) — specified so those combos aren't an ambiguous tested branch.
 - **Confirm gate (writes only):** if neither `--yes` nor `--json` is set:
   - TTY → prompt `Apply <verb> to N contacts? [y/N]` (via `typer.confirm`); N aborts exit 0.
   - **non-TTY → refuse, exit 2** (`"stdin is not a TTY; pass --yes or --json"`).
@@ -75,9 +76,11 @@ crm bulk log  --kind <k> [--channel --date --summary] [filters] [--all] [--dry-r
 ### `crm bulk set <field>=<value>`
 - Parse `field=value`; **no `=` → exit 2** (matches single `set_field`).
 - **Scalar fields only:** `field ∈ SETTABLE` AND `field ∉ ARRAY_FIELDS`. A
-  non-settable field → exit 1; an **array field** (`tags`/`affiliations`) → exit 2
-  with `"bulk set handles scalar fields; for tags use: crm bulk tag <tag>"`. (Bulk
-  `affiliations` append is deferred — YAGNI.)
+  non-settable field → exit 1 (matches single `set_field`); an **array field**
+  (`tags`/`affiliations`) → exit 2 with `"bulk set handles scalar fields; for tags
+  use: crm bulk tag <tag>"`. (The array-field→exit-2 is an **intentional
+  divergence** from single `set_field`, which appends to arrays — bulk treats it as
+  a usage error. Bulk `affiliations` append is deferred — YAGNI.)
 - Enum field: `value ∈ ENUM_VALUES[field]` else exit 1 (matches single `set`).
 - Write: same value across the set, so
   `client.table("contacts").update({field:value,"updated_at":"now()"}).in_("id", chunk)`

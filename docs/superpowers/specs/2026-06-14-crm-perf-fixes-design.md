@@ -160,12 +160,15 @@ Python from the loop (unchanged). Payload chunked ≤ PAGE (100).
 - **Insert once:** `interactions.insert([...])` for all participants.
 - **Bump once — new shared helper `_bump_last_touchpoint_bulk(client, ids, occurred, channel, topic)`** (also used by single `log` and by `crm bulk log`):
   - if `occurred` is None → return (no bump), matching `_bump_last_touchpoint`.
-  - one `.in_("id", ids)` read of `last_touchpoint_at`; pick ids where stored is
-    null OR stored `< occurred` (strict `<` ⇒ **equal date is a no-op**, matching
-    today's `>=` early-return).
+  - read `last_touchpoint_at` for the ids, **chunked by `CHUNK` (500) `.in_()`
+    reads** (a 1000+ id `.in_()` blows the URL length — the same hazard guarded
+    for `bulk set`); pick ids where stored is null OR stored `< occurred` (strict
+    `<` ⇒ **equal date is a no-op**, matching today's `>=` early-return).
   - if no ids qualify → **skip the update** (no empty `.in_([])` call).
-  - else one `.update({last_touchpoint_at, last_touchpoint_channel,
-    last_touchpoint_topic, updated_at:"now()"}).in_("id", ids_to_bump)`.
+  - else `.update({last_touchpoint_at, last_touchpoint_channel,
+    last_touchpoint_topic, updated_at:"now()"}).in_("id", chunk)` **chunked by
+    `CHUNK`** over `ids_to_bump` (one update per chunk). `CHUNK` is a
+    monkeypatchable module constant so boundary tests use small values.
 - Refactor single `log` (log.py:43) to call the same helper.
 
 **Round-trips:** event of P participants: ~3P → ~4.
@@ -234,11 +237,13 @@ REMOVED — Finding 1 is now client-side.)
 Local Supabase stack only (`conftest.py` fixture; refuses non-local URLs).
 
 **Infra (gates the coverage claim):**
-- Add `pytest-cov` to the dev group in `pyproject.toml`; add
-  `[tool.coverage.run] source = ["crm"]`, `branch = true`. Run with
-  `pytest --cov=crm --cov-report=term-missing`. "100% on changed code" is
-  enforced by **`diff-cover`** against `main` (whole-repo 100% is out of scope) —
-  add `diff-cover` to dev deps and document the command.
+- Add `pytest-cov` AND `diff-cover` to the `[dependency-groups] dev` list in
+  `pyproject.toml` (the project uses `uv`; `uv.lock` is regenerated). Add
+  `[tool.coverage.run] source = ["crm"]`, `branch = true`. Run
+  `pytest --cov=crm --cov-report=xml --cov-report=term-missing` (the **xml** report
+  is what `diff-cover` consumes). "100% on changed code" is enforced by
+  `diff-cover coverage.xml --compare-branch=main --fail-under=100` (whole-repo
+  100% is out of scope). Document both commands in the PR.
 - **Migration application:** the new RPCs require `0006` (and bulk-edit's `0007`)
   applied. Document a preflight: `supabase db reset` before the suite (or
   `supabase migration up`). `conftest.py` only truncates `DATA_TABLES`; add a note
@@ -247,13 +252,29 @@ Local Supabase stack only (`conftest.py` fixture; refuses non-local URLs).
   pinned by **behavioral DB-assertion tests** (seed → call → assert resulting
   rows field-by-field), enumerated below — this is the real coverage contract for
   the SQL, distinct from the Python line-coverage number.
-- **Round-trip regression spy:** monkeypatch the module-level `get_client`
-  factory (workers call it per-thread, so patching one instance won't catch them)
-  with a chaining-aware counting proxy — the `_Proxy` pattern already in
-  `test_contacts.py`. Document the EXACT expected call counts per command (e.g.
-  dedup cluster: 1 create RPC + 2 reads + 2 inserts + N_contacts updates; backfill
-  page: 1 `bulk_upsert_interactions` + 1 staging upsert + `_bulk_match`/event
-  reads). The proxy ships as `tests/_spy.py` with `# pragma: no cover`.
+- **Round-trip regression spy:** monkeypatch the per-module imported binding
+  `crm.commands.dedup.get_client` / `crm.commands.backfill.get_client` (NOT
+  `crm.config.get_client` — both modules do `from crm.config import get_client`,
+  and workers call it per-thread, so the patch must hit the imported name). Use a
+  **new** chaining-aware counting proxy built fresh in `tests/_spy.py` — note the
+  existing `_Proxy` in `test_contacts.py` is a *fault-injection delegator* (it
+  swaps one table for a raising stub), NOT a call counter, so it's the structural
+  shape to follow (table-dispatch + `__getattr__` passthrough) but the counting is
+  net-new: wrap each builder method, return self for chaining, increment a counter
+  keyed at the terminal `.execute()` (and at `.rpc()`). Ships with
+  `# pragma: no cover`.
+  Document the EXACT expected call counts per command, enumerated precisely (not
+  glossed):
+  - dedup cluster: 1 `create_contacts_with_identities` RPC + 1 `contacts` read +
+    1 `contact_identities` read + 1 `contact_identities` insert + 1
+    `enrichment_log` insert + N_distinct_contacts `contacts` updates + the chunked
+    staging upsert.
+  - backfill page: `_claim_page` (1 select + 1 update) + `_bulk_match` (≤1 read
+    per MATCH_KEY per value-chunk) + `_find_or_create_event` (1–2 per unique
+    event) + 1 `bulk_upsert_interactions` RPC + 1 staging upsert; then `_recompute`
+    (1 RPC per `RECOMPUTE_CHUNK`) after workers drain. (Backfill has three distinct
+    chunk constants — `PAGE=100`, `RECOMPUTE_CHUNK=500`, and the payload chunk —
+    use the right one when computing expected counts.)
 - **Monkeypatchable chunk/page constants** (e.g. `monkeypatch.setattr(mod, "PAGE", 2)`,
   same trick as `test_import_linkedin.py`'s `MAX_MEMBER_BYTES`) so boundary tests
   use 2/3 rows, not 100/500. Bulk-seed large fixtures via one `insert([...])`.
