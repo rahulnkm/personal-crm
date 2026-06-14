@@ -74,3 +74,21 @@ def test_exactly_one_current(db):
     _apply(db, c["id"], "location", "LA", "enrich_api", "pdl", 0.95)  # newer+higher → new winner
     cur = db.table("enrichment_log").select("new_value").eq("contact_id", c["id"]).eq("field","location").eq("is_current", True).execute().data
     assert len(cur) == 1
+
+
+def test_concurrent_applies_one_winner(db):
+    import concurrent.futures as cf
+    c = _contact(db, location=None)
+    vals = [("NYC","gravatar",0.9),("LA","pdl",0.92),("SF","github",0.88),("Berlin","pdl",0.95)]
+    def apply(v):
+        from crm.config import get_client
+        return get_client().rpc("enrich_apply_candidate", {
+            "p_contact_id": c["id"],"p_field":"location","p_value":v[0],
+            "p_method":"enrich_api","p_source":v[1],"p_confidence":v[2],
+            "p_source_detail":None,"p_dry_run":False}).execute().data
+    with cf.ThreadPoolExecutor(max_workers=4) as ex:
+        list(ex.map(apply, vals))
+    cur = db.table("enrichment_log").select("new_value").eq("contact_id",c["id"]).eq("field","location").eq("is_current",True).execute().data
+    assert len(cur) == 1
+    got = db.table("contacts").select("location").eq("id",c["id"]).single().execute().data["location"]
+    assert got == cur[0]["new_value"]  # materialized value matches the one current row
