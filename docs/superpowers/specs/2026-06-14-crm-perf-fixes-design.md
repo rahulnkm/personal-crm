@@ -147,7 +147,19 @@ documents this; the payload builder asserts non-null. (`kind`/`logged_by` are
 rows only — orphans excluded in Python and still patched `match_status='orphaned'`)
 and the staging patch list, then issues: one `bulk_upsert_interactions` RPC + one
 staging upsert per page. The `linked`/`orphaned` counters are still computed in
-Python from the loop (unchanged). Payload chunked ≤ PAGE (100).
+Python from the loop (unchanged). `touched.add(contact_id)` must still fire for
+**refreshed** rows, not just new inserts (preserves recompute coverage). Payload
+chunked ≤ PAGE (100).
+
+**Denorm-staleness fix (decided after review):** the `DO UPDATE` re-points
+`contact_id`; the OLD contact's `last_touchpoint_*` denorm would go stale and was
+never recomputed (a pre-existing latent bug — the Python select-first map that
+could have detected it is being deleted). So `bulk_upsert_interactions`
+`returns setof uuid` = the **prior** `contact_id`s of rows whose `contact_id`
+actually moved (via a CTE comparing the pre-update value to `excluded.contact_id`).
+`_process_page` unions those into `touched` so `_recompute` heals both the new and
+the abandoned contact. This makes the module's "recompute heals denorm staleness"
+claim actually true.
 
 ### Finding 3 (HIGH) — event add N+1 → bulk insert + shared bulk bump
 **Where:** `log.py` `event_add` (69–100): per participant a resolve, an
@@ -158,17 +170,14 @@ Python from the loop (unchanged). Payload chunked ≤ PAGE (100).
   `.in_("id", uuids)`; resolve names via existing `_resolve` (keep per-name
   ambiguity errors). Pre-insert resolve-before-write contract preserved.
 - **Insert once:** `interactions.insert([...])` for all participants.
-- **Bump once — new shared helper `_bump_last_touchpoint_bulk(client, ids, occurred, channel, topic)`** (also used by single `log` and by `crm bulk log`):
-  - if `occurred` is None → return (no bump), matching `_bump_last_touchpoint`.
-  - read `last_touchpoint_at` for the ids, **chunked by `CHUNK` (500) `.in_()`
-    reads** (a 1000+ id `.in_()` blows the URL length — the same hazard guarded
-    for `bulk set`); pick ids where stored is null OR stored `< occurred` (strict
-    `<` ⇒ **equal date is a no-op**, matching today's `>=` early-return).
-  - if no ids qualify → **skip the update** (no empty `.in_([])` call).
-  - else `.update({last_touchpoint_at, last_touchpoint_channel,
-    last_touchpoint_topic, updated_at:"now()"}).in_("id", chunk)` **chunked by
-    `CHUNK`** over `ids_to_bump` (one update per chunk). `CHUNK` is a
-    monkeypatchable module constant so boundary tests use small values.
+- **Bump once — new shared helper `_bump_last_touchpoint_bulk(client, ids, occurred, channel, topic)`** (also used by single `log` and by `crm bulk log`). **It delegates to a server-side RPC** (decided after review — a client-side read-then-write is a TOCTOU lost-update: a concurrent `crm log` writing a newer date could be overwritten by this bulk write's stale snapshot, across the whole cohort). The helper:
+  - if `occurred` is None or `ids` empty → return (matches `_bump_last_touchpoint`).
+  - calls the new RPC **`bulk_bump_last_touchpoint(p_ids uuid[], p_occurred date, p_channel text, p_topic text)`** (migration 0006), chunked by `CHUNK` over `ids`. The RPC does ONE guarded statement:
+    `update contacts set last_touchpoint_at = p_occurred, last_touchpoint_channel = p_channel, last_touchpoint_topic = p_topic, updated_at = now() where id = any(p_ids) and (last_touchpoint_at is null or last_touchpoint_at < p_occurred)`.
+    The `< p_occurred` guard is re-evaluated server-side under the row lock, so a concurrently-written newer value is never clobbered (**equal date is a no-op**, matching today's `>=` early-return). This mirrors `bulk_add_tag`'s proven single-statement read-modify-write, fixes the **pre-existing** single-`log` race for free, and removes the read round-trips entirely.
+  - `CHUNK` is a monkeypatchable module constant (in `src/crm/bulk.py`) so boundary tests use small values.
+
+Refactor single `log` (log.py:43) to call `_bump_last_touchpoint_bulk(client, [contact_id], …)` so the one bump path is shared and race-safe. (Single `log` now needs migration 0006 applied — fine, 0006 lands first.)
 - Refactor single `log` (log.py:43) to call the same helper.
 
 **Round-trips:** event of P participants: ~3P → ~4.
@@ -225,13 +234,23 @@ guard against a pathological import**, not a perf win.
 - `merge`'s 3 fixed reparent updates (bounded, rare).
 
 ## New SQL — migration `0006_perf_rpcs.sql`
-Functions: `bulk_upsert_interactions(payload jsonb) returns void`,
-`crm_stats() returns jsonb`. Each: `set search_path = public, extensions`,
+Functions: `bulk_upsert_interactions(payload jsonb) returns setof uuid` (moved old
+contact_ids), `crm_stats() returns jsonb`, and
+`bulk_bump_last_touchpoint(p_ids uuid[], p_occurred date, p_channel text, p_topic text) returns void`.
+Each: `set search_path = public, extensions`, then BOTH
+`revoke execute … from public` (defense-in-depth — Postgres grants EXECUTE to
+PUBLIC by default; RLS is the only backstop otherwise) AND
 `grant execute … to service_role`. Record a `drop function if exists` rollback
 line per function in the PR. **No new index needed** — `bulk_upsert_interactions`
-uses the existing `interactions_source_ext` partial unique index; `crm_stats`
-GROUP BYs scan small tables. (The `attach_and_fill` RPC from the prior draft is
-REMOVED — Finding 1 is now client-side.)
+uses the existing `interactions_source_ext` partial unique index; the bump uses
+the contacts PK; `crm_stats` GROUP BYs scan small tables. (The `attach_and_fill`
+RPC from the prior draft is REMOVED — Finding 1 is now client-side.)
+
+**No statement_timeout change needed** for cloud deploy: every RPC payload is
+chunked (≤ PAGE/CHUNK) well under the 8 s service-role limit. New RPCs ship via
+`supabase db push` to any cloud project (each carries its own grant, since the
+historical blanket `grant … on all functions` only covered functions existing at
+0001/0002).
 
 ## Testing
 Local Supabase stack only (`conftest.py` fixture; refuses non-local URLs).
@@ -303,17 +322,24 @@ Local Supabase stack only (`conftest.py` fixture; refuses non-local URLs).
   trigram); exact notice text; negative branch (no notice when all buckets ≤ 200).
 
 ## Benchmark — `scripts/bench_bulk.py`
-- **Primary metric: round-trip count**, captured via the same counting proxy
-  ("event add 50 participants: 150 → 4"; "backfill refresh 100 rows: 100 → 1";
-  "stats: 16 → 1"). This is honest on the local stack where RTT ≈ 0.
-- **Remote-equivalent wall-clock:** the proxy injects a fixed artificial per-call
-  latency (e.g. 50 ms) to simulate remote Supabase; report old-path vs new-path
-  wall-clock as **clearly labeled "remote-equivalent (50 ms injected RTT)"**.
+- **Primary, headline metric: round-trip count ratios**, exact integers from the
+  counting proxy that a reviewer can verify: backfill refresh 100 rows: **~101 → 1**;
+  event add 50 participants: **~150 → ~4**; stats: **16 → 1**; dedup cluster of K
+  auto-matches on one contact: **~3K → ~5**; bulk verbs N ids: **N → ⌈N/CHUNK⌉**.
+  Honest on the local stack where RTT ≈ 0. **Lead the PR with this table.**
+- **Remote projection (not a measurement):** report ONE derived line per fix —
+  "at an assumed 50 ms RTT: ~Xs → ~Ys, computed from the round-trip counts." Do
+  NOT report median/p90 of injected-sleep wall-clock — with a fixed per-call sleep
+  that number is exactly `count × sleep` (circular theater). Round-trip count is
+  the falsifiable metric; latency is a projection, labeled as such.
 - The old per-row path is deleted, so the benchmark includes a **reference naive
-  loop** (re-implements the per-row pattern against the same seeded DB, labeled
-  "reference") to compare against — it does not resurrect dead code in `crm/`.
-- Methodology: fixed seed, N ∈ {100, 1000}, ≥5 repetitions, report **median + p90**
-  via `time.perf_counter`, reset DB state between runs.
+  loop re-implemented inline in the script** (NOT in `crm/`), each loop commented
+  with the exact old line range it mirrors (backfill.py:121-125 etc.) so it's a
+  faithful baseline, not a strawman. Net-new bulk verbs use a loop labeled "naive
+  baseline" (no prior impl existed).
+- Methodology: fixed seed chosen so every refresh row is a `hit` and every
+  participant is bump-eligible (else the ratios don't reproduce); truncate data
+  tables between runs (not full `db reset`); one warm-up discard.
 
 ## Success criteria
 - All six findings fixed; behavior contracts pinned by assertions (existing tests
