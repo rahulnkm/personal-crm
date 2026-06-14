@@ -33,24 +33,6 @@ def _load_pending(client):
             return out
 
 
-def _attach_identity(client, identity: dict, contact_id: str) -> bool:
-    """Reproduce sequential _attach EXACTLY: select-first identity guard incl. the
-    rerun_conflict branch; fill-null UPDATE; conflict-log. Returns False on conflict
-    (caller must route the row to needs_review/rerun_conflict, NOT auto_matched)."""
-    existing = []
-    if identity.get("source_external_id"):
-        existing = (client.table("contact_identities").select("id,contact_id")
-                    .eq("source", identity["source"])
-                    .eq("source_external_id", identity["source_external_id"]).execute().data)
-    if existing:
-        if existing[0]["contact_id"] != contact_id:
-            return False                                  # rerun_conflict
-    else:
-        client.table("contact_identities").insert(
-            {"contact_id": contact_id, **{f: identity.get(f) for f in IDENTITY_FIELDS}}).execute()
-    return True
-
-
 def _fill_and_log(client, contact_id, staged, source):
     contact = client.table("contacts").select("*").eq("id", contact_id).single().execute().data
     updates, conflicts = {}, []
@@ -91,6 +73,64 @@ def _bump(state, lock, key):
         state[key] += 1
 
 
+def _fold_auto(auto, deref, contact_by_id, existing):
+    """PURE in-memory replay of the sequential auto_matched path (no DB).
+
+    Walks `auto` items in plan order and reproduces _attach_identity + _fill_and_log
+    serial semantics against an in-memory per-contact accumulator, so later items in a
+    cluster see earlier items' fills (the load-bearing cross-item guarantee).
+
+    Args:
+        auto: auto_matched plan items, in PLAN ORDER.
+        deref: create_key→uuid resolver (identity for already-real uuids).
+        contact_by_id: {contact_uuid: contact-row dict} for every dereferenced target.
+        existing: {(source, source_external_id): contact_id} prefetched DB identity map.
+
+    Returns:
+        id_inserts: list of contact_identities rows to insert-or-ignore.
+        enrich_rows: list of enrichment_log rows (import_conflict).
+        fills: {contact_id: {field: value}} fill-null updates, one per contact.
+        outcomes: {item_id: "attached" | "conflict"}.
+    """
+    acc = {cid: dict(row) for cid, row in contact_by_id.items()}  # mutable per-contact state
+    seen_identities = dict(existing)              # DB map + in-cluster queued inserts
+    id_inserts, enrich_rows, fills, outcomes = [], [], {}, {}
+    for it in auto:
+        cid = deref(it["matched_ref"])
+        ident = it["identity"]
+        staged = it["staged"]
+        k = (ident.get("source"), ident.get("source_external_id"))
+        if ident.get("source_external_id") and k in seen_identities:
+            if seen_identities[k] != cid:
+                outcomes[it["id"]] = "conflict"      # identity lives on another contact
+                continue
+            # same contact: no re-insert; fall through to fill
+        elif ident.get("source_external_id"):
+            id_inserts.append({"contact_id": cid,
+                               **{f: ident.get(f) for f in IDENTITY_FIELDS}})
+            seen_identities[k] = cid
+        # FILL against the accumulator (mirrors the per-item DB re-read), write-back so
+        # later items in this cluster see what earlier items filled.
+        for cf, sf in FILL.items():
+            new = staged.get(sf)
+            if not new:
+                continue
+            if not acc[cid].get(cf):
+                fills.setdefault(cid, {})[cf] = new
+                acc[cid][cf] = new                   # WRITE BACK
+            elif acc[cid][cf] != new:
+                enrich_rows.append({"contact_id": cid, "field": cf, "old_value": acc[cid][cf],
+                                    "new_value": new, "source": it["source"],
+                                    "method": "import_conflict"})
+        if staged.get("full_name") and staged["full_name"] != acc[cid].get("full_name"):
+            enrich_rows.append({"contact_id": cid, "field": "full_name",
+                                "old_value": acc[cid].get("full_name"),
+                                "new_value": staged["full_name"], "source": it["source"],
+                                "method": "import_conflict"})
+        outcomes[it["id"]] = "attached"
+    return id_inserts, enrich_rows, fills, outcomes
+
+
 def _execute_cluster(client, items, state, lock):
     keymap = {}
     creates = [it for it in items if it.get("create_key")]
@@ -105,6 +145,34 @@ def _execute_cluster(client, items, state, lock):
     def deref(ref):
         return keymap.get(ref, ref)
 
+    # ---- auto_matched branch: batched reads → in-memory fold → batched writes ----
+    auto = [it for it in items if it["match_status"] == "auto_matched"]
+    cids = sorted({deref(it["matched_ref"]) for it in auto})
+    contact_by_id = {c["id"]: c for c in
+                     client.table("contacts").select("*").in_("id", cids).execute().data} \
+        if cids else {}
+    sxids = sorted({it["identity"]["source_external_id"] for it in auto
+                    if it["identity"].get("source_external_id")})
+    existing = {}                                  # (source, source_external_id) -> contact_id
+    for i in range(0, len(sxids), 100):
+        for r in (client.table("contact_identities")
+                  .select("source,source_external_id,contact_id")
+                  .in_("source_external_id", sxids[i:i + 100]).execute().data):
+            existing[(r["source"], r["source_external_id"])] = r["contact_id"]
+
+    id_inserts, enrich_rows, fills, outcomes = _fold_auto(
+        auto, deref, contact_by_id, existing)
+
+    if id_inserts:
+        # insert-or-ignore via RPC: PostgREST .upsert() can't target the PARTIAL
+        # unique index on (source, source_external_id), and ON CONFLICT DO NOTHING
+        # guarantees a duplicate/pre-existing identity never aborts the batch.
+        client.rpc("bulk_insert_identities", {"payload": id_inserts}).execute()
+    if enrich_rows:
+        client.table("enrichment_log").insert(enrich_rows).execute()
+    for cid, upd in fills.items():
+        client.table("contacts").update({**upd, "updated_at": "now()"}).eq("id", cid).execute()
+
     patches = []
     for it in items:
         st = it["match_status"]
@@ -116,8 +184,7 @@ def _execute_cluster(client, items, state, lock):
             _bump(state, lock, "created")
         elif st == "auto_matched":
             cid = deref(it["matched_ref"])
-            if _attach_identity(client, it["identity"], cid):
-                _fill_and_log(client, cid, it["staged"], it["source"])
+            if outcomes[it["id"]] == "attached":
                 patches.append(_patch(it, "auto_matched", cid,
                                       conf=it.get("match_confidence"), method=it["match_method"]))
                 _bump(state, lock, "auto")
@@ -138,8 +205,8 @@ def _execute_cluster(client, items, state, lock):
 def _attach(client, staged: dict, contact_id: str) -> bool:
     """Sequential single-row attach — used by `crm review --approve`. Idempotent
     select-first identity guard (rerun_conflict patches staging + returns False),
-    then fill-null + conflict-log. The bulk dedup path uses _attach_identity +
-    _fill_and_log instead; this preserves the manual-review callsite unchanged."""
+    then fill-null + conflict-log. The bulk dedup path uses the batched _fold_auto
+    fold instead; this preserves the manual-review callsite unchanged."""
     existing = []
     if staged.get("source_external_id"):
         existing = (client.table("contact_identities")
