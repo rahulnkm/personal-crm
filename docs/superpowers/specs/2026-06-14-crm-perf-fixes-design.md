@@ -1,207 +1,303 @@
 # CRM CLI — Performance Fixes (N+1 elimination) — Design
 
 **Date:** 2026-06-14
-**Status:** Approved for planning
-**Companion spec:** `2026-06-14-crm-bulk-edit-design.md` (shares migration `0006` and the cohort/bulk infra)
+**Status:** Approved for planning (revised after 2nd adversarial review)
+**Companion spec:** `2026-06-14-crm-bulk-edit-design.md`
+**Sequencing:** this spec lands FIRST — it creates migration `0006` and the shared
+`_bump_last_touchpoint_bulk` helper that the bulk-edit spec consumes. Bulk-edit
+adds its own migration `0007` (no shared file → safe to implement after).
 
 ## Problem
 
-A performance audit of the `crm` CLI found six issues. All but one are the same
-root cause: **N+1 round-trips** — code loops over rows issuing one
-`client.<table>().…​.execute()` (one HTTPS round-trip to Supabase/PostgREST) per
-row, where a single set-based call would do. Over a remote Supabase connection
-(RTT 30–100 ms+) the cost of a loop is `N × RTT`; the fix makes it
-`⌈N / chunk⌉ × RTT`. The remaining issue is a worst-case quadratic in name
-clustering.
+A performance audit found six issues in the `crm` CLI. Five share one root cause:
+**N+1 round-trips** — a loop over rows issues one
+`client.<table>()…​.execute()` (one HTTPS round-trip to Supabase/PostgREST) per
+row, where a single set-based call would do. The sixth is a worst-case quadratic
+in name clustering.
 
-The codebase already proves the target pattern: `create_contacts_with_identities`
-and `backfill_recompute_contacts` are `plpgsql` RPCs that take one `jsonb`
-payload, expand it with `jsonb_to_recordset`, and run one set-based statement.
-This spec extends that pattern; it does not invent a new one.
+### Honest framing of the win (revised)
+The headline metric is **round-trip count**, not wall-clock. Each `.execute()` is
+one network round-trip; the cost of a loop is `N × RTT`. Against a **local**
+Supabase (the default dev/test target) RTT ≈ 0–1 ms, so wall-clock barely moves —
+the real, measurable improvement locally is the **call-count reduction** (e.g.
+"event with 50 participants: ~150 calls → 4"). The wall-clock win is felt on
+**remote** Supabase (README documents a cloud deploy; RTT 30–100 ms) and inside
+**agent loops** that call these commands repeatedly (see
+`docs/operational-loads.md`). We do NOT claim a dramatic local wall-clock number;
+we report round-trip reduction as the primary figure and a latency-injected
+wall-clock run as the remote-equivalent (see Benchmark).
 
-## Guiding technique (research-validated)
+## Technique selection (revised)
 
-- **Per-row loop with DISTINCT values per row** → RPC taking `payload jsonb`,
-  `update … from jsonb_to_recordset(payload) as p(<typed cols>) where …`. The
-  `AS p(...)` type list is load-bearing: every jsonb value arrives as text and is
-  cast per the declared types.
-- **Conditional bump ("only if greater")** → same shape with the guard in the
-  `WHERE` (`where p.x > c.x`); set-based and race-safe, mirrors
-  `backfill_recompute_contacts`.
-- **Insert-or-update against a PARTIAL unique index** (PostgREST `.upsert()`
-  cannot target these) → RPC with
-  `insert … select from jsonb_to_recordset(...) on conflict (cols) where <predicate> do update set …`.
-- **Same value across the whole set** → no RPC needed; PostgREST
-  `.update(payload).in_("id", ids)` is already one round-trip.
-- Every new function: `set search_path = public, extensions` (matches every
-  existing function in the repo), `grant execute … to service_role`, and callers
-  chunk ≤ 500 rows/call to stay under the 8 s service-role statement timeout (the
-  existing `RECOMPUTE_CHUNK = 500` pattern).
+Prefer the **simplest tool that preserves the existing, already-tested behavior**:
+
+- **Batch the READS client-side** and keep branching logic in Python when that
+  logic is subtle and already covered by tests (Finding 1). One bulk `.in_()`
+  read replaces N per-row reads; the Python keeps byte-identical routing.
+- **Same value across the set** → PostgREST `.update(payload).in_("id", ids)` in
+  one round-trip (Finding 3 bump). No RPC.
+- **RPC (plpgsql)** ONLY where PostgREST genuinely cannot express the operation:
+  a **partial-index** conflict target (Finding 2) or a set-based aggregate
+  (Finding 5). RPCs take one `payload jsonb`, expand with `jsonb_to_recordset`,
+  run one statement. Every value in jsonb arrives as **text** and is cast per the
+  `AS p(...)` type list — that list is load-bearing (declare `uuid`/`date`/
+  `timestamptz`/enum/`jsonb` correctly or the call aborts with a cast error).
+- Every new function: `set search_path = public, extensions` (repo convention),
+  `grant execute … to service_role`, and a `drop function if exists …` rollback
+  line recorded in the spec/PR (free tier has no backups). Callers chunk so no
+  single statement risks the 8 s service-role statement timeout.
 
 ## Scope — the six findings
 
-### Finding 1 (HIGH) — dedup execute N+1
-**Where:** `src/crm/commands/dedup.py` — `_execute_cluster` (lines ~94–135),
-calling `_attach_identity` (36–51) and `_fill_and_log` (54–73) once per
-`auto_matched` item.
+### Finding 1 (HIGH) — dedup execute N+1 → CLIENT-SIDE BATCH (no RPC)
+**Where:** `src/crm/commands/dedup.py` — `_execute_cluster` (~94–135) calling
+`_attach_identity` (36–51) and `_fill_and_log` (54–73) once per `auto_matched`
+item: per item ~3–5 round-trips (identity select, identity insert, `select *`
+single contact, contact update, enrichment_log insert), serialized because
+`_union_by_existing_contact` funnels all items touching one contact onto one
+cluster/thread.
 
-**Now:** per auto-matched item, 2–5 serial round-trips (identity select, identity
-insert, `select * from contacts` single, contact update, enrichment_log insert).
-Items touching one contact are funnelled to a single cluster on a single thread
-(to avoid write races), so a popular contact becomes a long serial chain.
+**Why NOT an RPC (decided in review):** a set-based `UPDATE … FROM` cannot
+reproduce the current **serial, in-order** semantics. Today item N re-reads the
+contact *after* items 1…N-1 wrote it, so the first fill of a null column wins and
+a later differing value is logged as an `import_conflict`. A set statement
+evaluates every row against the pre-statement snapshot (so it logs zero
+conflicts) and, with duplicate join keys, Postgres updates the target once with a
+**nondeterministic** source row. That silently changes data and drops provenance
+for exactly the multi-row-same-contact clusters the union step creates. A plpgsql
+serial loop could mimic it but would have to perfectly mirror Python routing —
+standing drift risk for marginal gain at this scale.
 
-**Fix:** new RPC **`attach_and_fill(payload jsonb)`** processing all
-`auto_matched` items of a cluster in one call. Per item the function:
-1. Looks up the existing identity by `(source, source_external_id)` (the
-   `identities_source_external_id` partial unique index).
-2. If an identity exists and points to a **different** contact → record the item
-   as a **conflict** (do not attach, do not fill).
-3. Else insert the identity if absent (against the partial unique index).
-4. Apply fill-null updates to `contacts` (only columns currently null), using the
-   `FILL` map (`current_role←role`, `current_company←company`, …).
-5. Insert `enrichment_log` rows for fields where staged value ≠ existing non-null
-   value (`method = 'import_conflict'`), and for a differing `full_name`.
+**Fix — batch reads, fold in Python, batch writes. Per cluster:**
+1. **One** `contacts` read: `select * … .in_("id", contact_ids)` for all distinct
+   target contact ids in the cluster (ids already known after `create` RPC +
+   `deref`). Build `contact_by_id`.
+2. **One** `contact_identities` read per identity key the items use, batched with
+   `.in_()`, to resolve the existing-identity / `rerun_conflict` check.
+3. **Fold in Python, in plan order** (preserving today's semantics exactly):
+   maintain an in-memory accumulator of each contact's evolving column state.
+   For each item: apply the existing `_attach_identity` conflict rule (existing
+   identity → different contact ⇒ outcome `conflict`, route to `needs_review`
+   with `method='rerun_conflict'`, `resolved=False`, **no** `match_confidence` —
+   matching dedup.py:125); else outcome `attached`. For attached items, compute
+   fill-null updates and `import_conflict` rows against the **accumulator** (so a
+   later item sees an earlier item's fill, identical to the serial loop), using
+   the `FILL` map (`current_role←role, current_company←company, location←location`)
+   and the `full_name` conflict rule (dedup.py:65–66).
+4. **Batch the writes:** one `contact_identities.insert([...])` for absent
+   identities; one `enrichment_log.insert([...])` for all conflict rows; and the
+   fill-null updates as **one update per distinct contact** (typically one — the
+   cluster is usually a single existing contact). Outcomes are keyed by staging
+   **row id** (PK-unique), never `(source, source_external_id)` (which can repeat
+   in a payload), so Python re-associates outcomes unambiguously.
 
-**Returns:** `setof` rows `{ item_key uuid/text, outcome text }` where outcome is
-`'attached'` or `'conflict'`. Python uses this to build `_patch(...)` for each
-item: `attached` → `auto_matched` patch; `conflict` → `needs_review` patch with
-`method='rerun_conflict'`. **Behavior contract: identical routing to the current
-per-row code** — the new-contact create path (`create_contacts_with_identities`)
-and the final chunked staging upsert are unchanged.
+**Behavior contract (must be pinned by tests, not prose):** the `_patch(...)`
+dict for each outcome is byte-identical to today — `attached` →
+`auto_matched` patch carrying `match_confidence`; `conflict` → `needs_review`
+patch with `method='rerun_conflict'`, no `resolved_at`, no `match_confidence`. The
+create path (`create_contacts_with_identities`) and the final chunked staging
+upsert are unchanged. Same-contact existing identity ⇒ no re-insert but fill +
+conflict-log still run (matches `_attach_identity` returning True). A row may
+auto-match a sibling created in the same cluster — Python derefs
+`matched_ref`→uuid (via `keymap`) BEFORE building the read set.
 
-`item_key`: the staging row identity `(source, source_external_id)` carried into
-and back out of the payload so Python can re-associate outcomes with items.
+**Round-trips:** cluster of K auto-matches: ~3K → ~5 (create RPC + 2 reads + 2
+bulk inserts + 1 update/contact). **Concurrency:** threading model unchanged;
+the per-cluster single-thread invariant still prevents cross-cluster contention
+on a shared contact (union-by-existing-contact guarantees one contact lives in
+one cluster).
 
-**Round-trips:** cluster of K auto-matches: ~3K → 1 (plus the existing create RPC
-and staging upsert).
+### Finding 2 (HIGH) — backfill refresh N+1 → `bulk_upsert_interactions` RPC
+**Where:** `backfill.py` `_process_page` — the `hit` branch (121–125) fires one
+`interactions.update().eq("id", hit).execute()` per already-existing interaction,
+inside the per-row loop. On any re-import / `--retry-orphans` rerun most rows
+exist → a 100-row page degrades to ~100 serial updates.
 
-### Finding 2 (HIGH) — backfill refresh N+1
-**Where:** `src/crm/commands/backfill.py` `_process_page` — the `hit` branch at
-lines 121–125 fires one `interactions.update().eq("id", hit).execute()` per
-already-existing interaction, inside the per-row loop.
+**Fix:** new RPC **`bulk_upsert_interactions(payload jsonb) returns void`**:
+```
+insert into interactions
+  (contact_id, event_id, kind, channel, occurred_at, summary,
+   logged_by, source, source_external_id)
+select p.contact_id, p.event_id, p.kind, p.channel, p.occurred_at, p.summary,
+       p.logged_by, p.source, p.source_external_id
+from jsonb_to_recordset(payload) as p(
+  contact_id uuid, event_id uuid, kind interaction_kind, channel text,
+  occurred_at date, summary text, logged_by text, source text,
+  source_external_id text)
+on conflict (source, source_external_id) where source_external_id is not null
+do update set occurred_at = excluded.occurred_at, summary = excluded.summary,
+              event_id = excluded.event_id, contact_id = excluded.contact_id,
+              updated_at = now();
+```
+This targets the partial unique index `interactions_source_ext`
+(`where source_external_id is not null`) — which PostgREST `.upsert()` cannot
+express, hence the RPC. **`DO UPDATE` touches only the 5 mutable columns**
+(matching today's refresh); `kind`/`channel`/`logged_by` are set on insert and
+**never overwritten** on refresh.
 
-**Now:** on any re-import / `--retry-orphans` rerun most rows already exist, so a
-100-row page degrades to ~100 serial updates instead of the ~10 bulk round-trips
-the module docstring promises.
+**NULL-safety contract:** rows with `source_external_id IS NULL` bypass the
+partial index → `ON CONFLICT` can't fire → they'd insert duplicates on every
+rerun. This is safe ONLY because `staging_interactions.source_external_id` is
+`NOT NULL` (schema 0003:9), so backfill never produces such a row. The RPC
+documents this; the payload builder asserts non-null. (`kind`/`logged_by` are
+`NOT NULL`/FK — always present in the payload.)
 
-**Fix:** new RPC **`bulk_upsert_interactions(payload jsonb)`** doing one
-`insert … select from jsonb_to_recordset(payload) as p(...) on conflict (source,
-source_external_id) where source_external_id is not null do update set
-occurred_at = excluded.occurred_at, summary = excluded.summary, event_id =
-excluded.event_id, contact_id = excluded.contact_id, updated_at = now()`. This
-targets the `interactions_source_ext` partial unique index and handles **both**
-insert and refresh in one statement.
+**Python changes:** `_process_page` drops the select-first `existing` map
+(98–104) and the per-row update. It builds one `interactions` payload (linked
+rows only — orphans excluded in Python and still patched `match_status='orphaned'`)
+and the staging patch list, then issues: one `bulk_upsert_interactions` RPC + one
+staging upsert per page. The `linked`/`orphaned` counters are still computed in
+Python from the loop (unchanged). Payload chunked ≤ PAGE (100).
 
-**Consequence:** the select-first idempotency check (`existing` map, lines 98–104)
-and the per-row update both disappear from `_process_page`. The function now
-builds one `interactions` payload (all linked rows) + the `staging_interactions`
-patch list, and issues: one `bulk_upsert_interactions` RPC + one staging upsert
-per page (plus `_bulk_match` reads and `_find_or_create_event`, unchanged).
-
-**Behavior contract:** the (source, source_external_id) arbiter resolves the same
-conflicts; refresh still updates in place and never duplicates; orphans
-(no contact) still get `match_status='orphaned'` and are NOT written to
-`interactions`. Payload chunked ≤ PAGE (100) — already the page size.
-
-### Finding 3 (HIGH) — event add N+1
-**Where:** `src/crm/commands/log.py` `event_add` (69–100): per participant, a
-resolve, an `interactions.insert()`, and `_bump_last_touchpoint` (select + update).
+### Finding 3 (HIGH) — event add N+1 → bulk insert + shared bulk bump
+**Where:** `log.py` `event_add` (69–100): per participant a resolve, an
+`interactions.insert()`, and `_bump_last_touchpoint` (select + update).
 
 **Fix (no new SQL):**
 - **Resolve once:** split refs into uuids vs names; resolve uuids with one
-  `.in_("id", uuids)`, resolve names with the existing `_resolve` (names may be
-  ambiguous and must keep their per-name error behavior). Net: one query for the
-  uuid set instead of one per uuid.
-- **Insert once:** build the full participant list and call
-  `interactions.insert([...]).execute()` once.
-- **Bump once:** all participants share `date`/`channel`/`name`. Read current
-  `last_touchpoint_at` for all participant ids in one `.in_("id", ids)`; in Python
-  pick the ids whose stored value is null or `< date`; issue one
-  `.update({last_touchpoint_at: date, …}).in_("id", ids_to_bump)` (same payload).
-- Pre-insert resolution-before-write contract (no phantom half-built event) is
-  preserved: resolve all refs first, then insert event, then participants.
+  `.in_("id", uuids)`; resolve names via existing `_resolve` (keep per-name
+  ambiguity errors). Pre-insert resolve-before-write contract preserved.
+- **Insert once:** `interactions.insert([...])` for all participants.
+- **Bump once — new shared helper `_bump_last_touchpoint_bulk(client, ids, occurred, channel, topic)`** (also used by single `log` and by `crm bulk log`):
+  - if `occurred` is None → return (no bump), matching `_bump_last_touchpoint`.
+  - one `.in_("id", ids)` read of `last_touchpoint_at`; pick ids where stored is
+    null OR stored `< occurred` (strict `<` ⇒ **equal date is a no-op**, matching
+    today's `>=` early-return).
+  - if no ids qualify → **skip the update** (no empty `.in_([])` call).
+  - else one `.update({last_touchpoint_at, last_touchpoint_channel,
+    last_touchpoint_topic, updated_at:"now()"}).in_("id", ids_to_bump)`.
+- Refactor single `log` (log.py:43) to call the same helper.
 
-**Round-trips:** event of P participants: ~3P → ~4 total.
+**Round-trips:** event of P participants: ~3P → ~4.
 
-Apply the same bump helper to single `log` (`log.py:43`) so the read+update bump
-lives in one shared, tested function.
+### Finding 4 (MED) — review queue N+1 → two-pass batch (no SQL)
+**Where:** `dedup.py` `review` (343–350) calling `_candidate_display` (231–285)
+per row (2–6 reads each).
 
-### Finding 4 (MED) — review queue N+1
-**Where:** `src/crm/commands/dedup.py` `review` (343–350) calling
-`_candidate_display` (231–285) per queue row (2–6 reads each).
+**Fix:** two-pass. Pass 1 collects, across the whole queue, every candidate
+`contact_id` and every identity `(field, value)` to look up — **applying the same
+`_is_role_email(val)` skip** the current code uses (dedup.py:248) so we don't
+over-fetch. Issue one bulk `contacts` `.in_("id", all_ids)` and one
+`contact_identities` `.in_()` per key column. Pass 2 renders from in-memory maps.
+`_candidate_display` becomes a pure function over the prefetched maps (testable
+without a client). Round-trips: O(R) → ~4.
 
-**Fix (no new SQL):** two-pass. Pass 1 collects, across the whole queue, every
-candidate `contact_id` and every identity `(field, value)` to look up. Issue one
-bulk `contacts` `.in_("id", all_ids)` and one bulk `contact_identities` query per
-key column (`email`/`linkedin_url`/`phone`) using `.in_()`. Build dicts. Pass 2
-renders each row from the in-memory maps. `_candidate_display` becomes a pure
-function over the prefetched maps (testable without a client).
+### Finding 5 (MED) — stats 16 round-trips → `crm_stats()` RPC
+**Where:** `admin.py` `stats` (74–98) — ~16 head-count queries.
 
-**Carry forward:** the current code skips role emails via `_is_role_email(val)`
-before the email-identity lookup (dedup.py:248). Pass 1 collection MUST apply the
-same filter, or the rewrite over-fetches and over-renders candidates.
-
-**Round-trips:** queue of R rows: O(R) → ~4 total.
-
-### Finding 5 (MED) — stats 16 round-trips
-**Where:** `src/crm/commands/admin.py` `stats` (74–98) — ~16 head-count queries.
-
-**Fix:** new RPC **`crm_stats()`** returning a single `jsonb` object with all
+**Fix:** new RPC **`crm_stats() returns jsonb`** returning one object with all
 buckets via `GROUP BY` over `contacts` (by `connection_status`, by
-`closeness_tier`), `staging` (by `match_status`), `staging_interactions`
-(by `match_status`), plus `contacts_total`. Python flattens it into the existing
-`out` list shape (so `--json` and table output are byte-for-byte compatible) and
-applies the same "drop zero rows except contacts_total" filter. **Ordering is
-re-imposed in Python:** `GROUP BY` returns buckets unordered and omits zero
-counts, so the flattening iterates the SAME fixed status/tier/match_status lists
-the current code uses, filling missing buckets with 0 — this preserves the exact
-metric order.
+`closeness_tier`), `staging` (by `match_status`), `staging_interactions` (by
+`match_status`), plus `contacts_total`. Counts cast to **int** (not bigint→float)
+so `--json` renders `3` not `3.0`.
 
-**Round-trips:** ~16 → 1.
+**Python flattening (parity is load-bearing):** iterate the SAME fixed literal
+lists the current code uses (`in_network/contact_on_file`; the 5 tiers; staging
+`pending/auto_matched/needs_review/merged/rejected`; touchpoints
+`pending/linked/orphaned`), defaulting any bucket the `GROUP BY` omitted to 0,
+then apply the existing filter `if count or metric == 'contacts_total'` (so a
+zero `contacts_total` still shows, other zeros drop). This reproduces the exact
+ordered `out` list. A parity test asserts full ordered-list equality on a seeded
+DB, including a dropped zero-bucket and a kept `contacts_total`. Round-trips:
+~16 → 1.
 
-### Finding 6 (MED) — clustering O(k²) tail
-**Where:** `src/crm/clustering.py` `cluster_rows` (77–96) — name-similarity edges
-are built by comparing all pairs within each trigram bucket. A *common* trigram
-yields a large bucket → O(k²) within that bucket.
+### Finding 6 (MED) — clustering O(k²) tail → bucket cap (no SQL)
+**Where:** `clustering.py` `cluster_rows` — the **name-similarity** loop (87–96)
+compares all pairs within each trigram bucket; a common trigram → large bucket →
+O(k²). (The exact-key buckets at 68–76 are O(k), untouched.)
 
-**Fix (no new SQL):** skip buckets larger than a configurable
-`MAX_BUCKET = 200` (module constant). Pairs lost to a skipped common trigram are
-still recovered through the row's rarer shared trigrams, so true matches survive.
-When any bucket is skipped, `err()` a one-line notice
-(`"clustering: skipped N oversized trigram bucket(s) (>200); rare-trigram edges still applied"`).
-Keep the existing `tri_of` memoization and union-find short-circuit.
+**Fix:** skip name-sim buckets larger than module constant `MAX_BUCKET = 200`.
+When any are skipped, `err()` exactly:
+`"clustering: skipped N oversized trigram bucket(s) (>200); rare-trigram edges still applied"`.
+Keep `tri_of` memoization and the union-find short-circuit.
+
+**Recovery is a heuristic, not lossless:** two names sharing ONLY an oversized
+trigram (no rarer shared trigram) are dropped — acceptable, vanishingly rare in a
+personal network, and surfaced by the notice. Reframe: this is a **robustness
+guard against a pathological import**, not a perf win.
 
 ## Out of scope
-- Changing dedup's per-cluster threading model (only the within-cluster work is
-  batched).
-- The single-record `contact` detail view (4 reads) — acceptable by design; only
-  flagged as a latent N+1 if ever looped (no such loop exists).
-- `merge`'s 3 fixed reparent updates (bounded, rare manual op).
+- The dedup per-cluster threading model (only within-cluster work changes).
+- The single-record `contact` detail view (4 reads, by design).
+- `merge`'s 3 fixed reparent updates (bounded, rare).
 
-## New SQL — migration `0006_bulk_operations.sql`
-Shared with the bulk-edit spec. Functions added by THIS spec:
-`attach_and_fill(payload jsonb) returns table(...)`,
-`bulk_upsert_interactions(payload jsonb) returns void`,
+## New SQL — migration `0006_perf_rpcs.sql`
+Functions: `bulk_upsert_interactions(payload jsonb) returns void`,
 `crm_stats() returns jsonb`. Each: `set search_path = public, extensions`,
-`grant execute … to service_role`. (The bulk-edit spec adds `bulk_add_tag` and
-`bulk_append_note` to the same migration.)
+`grant execute … to service_role`. Record a `drop function if exists` rollback
+line per function in the PR. **No new index needed** — `bulk_upsert_interactions`
+uses the existing `interactions_source_ext` partial unique index; `crm_stats`
+GROUP BYs scan small tables. (The `attach_and_fill` RPC from the prior draft is
+REMOVED — Finding 1 is now client-side.)
 
 ## Testing
-- Local Supabase stack only (existing `conftest.py` fixture; refuses non-local URLs).
-- Per finding: a behavior test proving output/routing is unchanged vs the old
-  path, plus a **round-trip regression test** — wrap/spy the client to assert the
-  bulk path issues ONE RPC (or the documented constant number of calls), not N.
-  E.g. monkeypatch `client.rpc` / `client.table(...).update` to count calls.
-- `attach_and_fill`: cases for fill-null, conflict→needs_review routing, identity
-  already present for the same contact (no-op insert), absent identity (insert).
-- `bulk_upsert_interactions`: insert path, refresh-in-place path (no duplicate),
-  orphan exclusion, idempotency on rerun.
-- `crm_stats`: parity with the old per-bucket counts on a seeded DB.
-- `cluster_rows`: oversized-bucket skip still clusters true matches; notice emitted.
-- `event_add` / `log`: bump-only-if-greater correctness; multi-participant batch.
+Local Supabase stack only (`conftest.py` fixture; refuses non-local URLs).
+
+**Infra (gates the coverage claim):**
+- Add `pytest-cov` to the dev group in `pyproject.toml`; add
+  `[tool.coverage.run] source = ["crm"]`, `branch = true`. Run with
+  `pytest --cov=crm --cov-report=term-missing`. "100% on changed code" is
+  enforced by **`diff-cover`** against `main` (whole-repo 100% is out of scope) —
+  add `diff-cover` to dev deps and document the command.
+- **Migration application:** the new RPCs require `0006` (and bulk-edit's `0007`)
+  applied. Document a preflight: `supabase db reset` before the suite (or
+  `supabase migration up`). `conftest.py` only truncates `DATA_TABLES`; add a note
+  that migrations must be applied first. CI/local loop runs the reset once.
+- **plpgsql is invisible to coverage tools.** Each RPC's internal branches are
+  pinned by **behavioral DB-assertion tests** (seed → call → assert resulting
+  rows field-by-field), enumerated below — this is the real coverage contract for
+  the SQL, distinct from the Python line-coverage number.
+- **Round-trip regression spy:** monkeypatch the module-level `get_client`
+  factory (workers call it per-thread, so patching one instance won't catch them)
+  with a chaining-aware counting proxy — the `_Proxy` pattern already in
+  `test_contacts.py`. Document the EXACT expected call counts per command (e.g.
+  dedup cluster: 1 create RPC + 2 reads + 2 inserts + N_contacts updates; backfill
+  page: 1 `bulk_upsert_interactions` + 1 staging upsert + `_bulk_match`/event
+  reads). The proxy ships as `tests/_spy.py` with `# pragma: no cover`.
+- **Monkeypatchable chunk/page constants** (e.g. `monkeypatch.setattr(mod, "PAGE", 2)`,
+  same trick as `test_import_linkedin.py`'s `MAX_MEMBER_BYTES`) so boundary tests
+  use 2/3 rows, not 100/500. Bulk-seed large fixtures via one `insert([...])`.
+- **Fault-injection / pragma:** the `_find_or_create_event` 23505 retry branch
+  and the dedup/backfill worker `except`/`Exit(1)` paths are race-only — cover via
+  a monkeypatched `insert` raising a fake `APIError(code="23505")` / forced
+  exception, or mark `# pragma: no cover` with justification. Decide per branch in
+  the plan; no silent gaps.
+
+**Behavioral cases:**
+- Finding 1: pin both outcome patches exactly (status, method, presence/absence of
+  `resolved_at` and `match_confidence`); fill-null vs `import_conflict` per field;
+  `full_name` conflict; same-contact existing identity ⇒ no re-insert but fill +
+  log still run; two items filling the same null col → earlier wins, later logs a
+  conflict (the serial-semantics regression guard); a row auto-matching a sibling
+  created in the same cluster.
+- Finding 2: insert path; refresh-in-place (no duplicate; `kind`/`channel`/
+  `logged_by` unchanged); orphan excluded from payload; idempotency on rerun;
+  payload non-null `source_external_id` assertion.
+- Finding 3: multi-participant batch; equal-date no-op; empty `ids_to_bump` skip;
+  None-date event skip.
+- Finding 4: parity render vs current `_candidate_display`; role-email skip.
+- Finding 5: full ordered-list equality on seeded DB (dropped zero, kept
+  `contacts_total`); int (not float) counts.
+- Finding 6: oversized-bucket skip still clusters true matches (which share a rare
+  trigram); exact notice text; negative branch (no notice when all buckets ≤ 200).
+
+## Benchmark — `scripts/bench_bulk.py`
+- **Primary metric: round-trip count**, captured via the same counting proxy
+  ("event add 50 participants: 150 → 4"; "backfill refresh 100 rows: 100 → 1";
+  "stats: 16 → 1"). This is honest on the local stack where RTT ≈ 0.
+- **Remote-equivalent wall-clock:** the proxy injects a fixed artificial per-call
+  latency (e.g. 50 ms) to simulate remote Supabase; report old-path vs new-path
+  wall-clock as **clearly labeled "remote-equivalent (50 ms injected RTT)"**.
+- The old per-row path is deleted, so the benchmark includes a **reference naive
+  loop** (re-implements the per-row pattern against the same seeded DB, labeled
+  "reference") to compare against — it does not resurrect dead code in `crm/`.
+- Methodology: fixed seed, N ∈ {100, 1000}, ≥5 repetitions, report **median + p90**
+  via `time.perf_counter`, reset DB state between runs.
 
 ## Success criteria
-- All six findings fixed; behavior contracts hold (existing tests stay green).
-- New + changed code at 100% line coverage (`pytest-cov`).
-- Benchmark (`scripts/bench_bulk.py`, shared with bulk-edit spec) shows the
-  round-trip reduction and wall-clock improvement on a seeded N.
+- All six findings fixed; behavior contracts pinned by assertions (existing tests
+  stay green).
+- New/changed code at 100% line coverage via `diff-cover` vs `main`; RPC SQL
+  branches covered by behavioral DB tests.
+- `scripts/bench_bulk.py` reports round-trip reductions (primary) + remote-
+  equivalent wall-clock (median/p90), honestly labeled.
