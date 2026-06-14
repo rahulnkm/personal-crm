@@ -7,12 +7,17 @@ from datetime import date as date_t
 
 import typer
 
+import crm.bulk as _bulk
 from crm.commands.admin import require_agent
 from crm.commands.contacts import _resolve
 from crm.config import get_client
 from crm.output import err
 
 VALID_KINDS = {"origin", "event", "email", "message", "call", "meeting"}
+
+# UUID format: 8-4-4-4-12 hex chars separated by hyphens (36 chars total)
+_UUID_RE = re.compile(r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$",
+                      re.IGNORECASE)
 
 event_app = typer.Typer(help="Shared occasions — group touchpoints linked to one event row.")
 
@@ -26,18 +31,29 @@ def _validate_iso_date(value: str | None) -> str | None:
     return value
 
 
+def _bump_last_touchpoint_bulk(client, ids: list[str], occurred: str | None,
+                                channel: str | None, topic: str | None):
+    """Server-side guarded monotonic bump for one or more contacts.
+
+    The RPC runs a single UPDATE filtered by `< p_occurred`, so equal-date is a
+    no-op and there is no read-before-write lost-update race. No-ops when
+    `occurred` is None or `ids` is empty.
+    """
+    if not occurred or not ids:
+        return
+    for i in range(0, len(ids), _bulk.CHUNK):
+        client.rpc("bulk_bump_last_touchpoint", {
+            "p_ids": ids[i:i + _bulk.CHUNK],
+            "p_occurred": occurred,
+            "p_channel": channel,
+            "p_topic": topic,
+        }).execute()
+
+
 def _bump_last_touchpoint(client, contact_id: str, occurred: str | None,
                           channel: str | None, topic: str | None):
-    if not occurred:
-        return
-    c = (client.table("contacts").select("last_touchpoint_at")
-         .eq("id", contact_id).single().execute().data)
-    if c["last_touchpoint_at"] and c["last_touchpoint_at"] >= occurred:
-        return
-    client.table("contacts").update(
-        {"last_touchpoint_at": occurred, "last_touchpoint_channel": channel,
-         "last_touchpoint_topic": topic, "updated_at": "now()"}
-    ).eq("id", contact_id).execute()
+    """Single-contact bump — delegates to the shared RPC-backed helper."""
+    _bump_last_touchpoint_bulk(client, [contact_id], occurred, channel, topic)
 
 
 def log(
@@ -81,24 +97,52 @@ def event_add(
     client = get_client()
     require_agent(client, agent)
 
-    # resolve every participant BEFORE inserting anything — a failure mid-loop
-    # would otherwise leave a phantom half-built event with no cleanup path
+    # ── Resolve ALL participants before touching the DB ────────────────────────
+    # Split refs into uuids vs names; batch-fetch uuids in one query.
     refs = [p.strip() for p in participants.split(",") if p.strip()]
-    resolved = [_resolve(client, ref) for ref in refs]
+    uuid_refs = [r for r in refs if _UUID_RE.match(r)]
+    name_refs = [r for r in refs if not _UUID_RE.match(r)]
 
+    resolved: list[dict] = []
+
+    # Batch-resolve uuid refs in ONE query and fail fast on any missing.
+    if uuid_refs:
+        rows = (client.table("contacts").select("*")
+                .in_("id", uuid_refs).execute().data)
+        found_ids = {r["id"] for r in rows}
+        missing = [u for u in uuid_refs if u not in found_ids]
+        if missing:
+            for m in missing:
+                err(f"No contact with id '{m}'")
+            raise typer.Exit(1)
+        # Preserve original ref ordering for uuid portion
+        by_id = {r["id"]: r for r in rows}
+        resolved += [by_id[u] for u in uuid_refs]
+
+    # Resolve name refs one-by-one (keeps fuzzy/ambiguity/exit-1 behaviour).
+    for ref in name_refs:
+        resolved.append(_resolve(client, ref))
+
+    # ── All resolved — now write ───────────────────────────────────────────────
     ev = client.table("events").insert(
         {"name": name, "occurred_at": date, "location": location,
          "event_notes": notes, "source": "manual", "created_by": agent}
     ).execute().data[0]
-    count = 0
-    for c in resolved:
-        client.table("interactions").insert(
+
+    # One batched interactions insert (not one per participant).
+    if resolved:
+        client.table("interactions").insert([
             {"contact_id": c["id"], "event_id": ev["id"], "kind": "event",
              "channel": "irl", "occurred_at": date, "logged_by": agent}
-        ).execute()
-        _bump_last_touchpoint(client, c["id"], date, "irl", name)  # topic = event name; per-person notes come later via event note
-        count += 1
-    err(f"event created with {count} participants")
+            for c in resolved
+        ]).execute()
+
+    # One RPC-backed bulk bump (chunked; equal-date = no-op; no lost-update race).
+    _bump_last_touchpoint_bulk(
+        client, [c["id"] for c in resolved], date, "irl", name
+    )
+
+    err(f"event created with {len(resolved)} participants")
     typer.echo(ev["id"])
 
 
