@@ -13,7 +13,7 @@ from crm.output import err, render
 SETTABLE = {
     "connection_status", "closeness_tier", "current_role", "current_company",
     "location", "origin_context", "email_status", "full_name",
-    "affiliations", "tags",
+    "affiliations", "tags", "last_enriched_at",
 }
 ARRAY_FIELDS = {"affiliations", "tags"}
 
@@ -77,6 +77,7 @@ def contact(ref: str = typer.Argument(..., help="Contact name or uuid"),
 def list_contacts(
     status: str = typer.Option(None, "--status"),
     tier: str = typer.Option(None, "--tier"),
+    role: str = typer.Option(None, "--role", help="Substring match on current_role"),
     tag: str = typer.Option(None, "--tag"),
     affiliation: str = typer.Option(None, "--affiliation"),
     cold_since: int = typer.Option(None, "--cold-since",
@@ -92,6 +93,10 @@ def list_contacts(
         "closeness_tier,affiliations,tags,last_touchpoint_at")
     q = _apply_filters(q, status=status, tier=tier, tag=tag,
                        affiliation=affiliation, cold_since=cold_since)
+    if role:
+        # escape LIKE wildcards so "f%under" matches literally, not as a pattern
+        pat = role.replace("\\", "\\\\").replace("%", r"\%").replace("_", r"\_")
+        q = q.ilike("current_role", f"%{pat}%")
     rows = q.order("last_touchpoint_at", desc=False, nullsfirst=True).limit(limit).execute().data
     render(rows, as_json)
 

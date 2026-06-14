@@ -31,6 +31,28 @@ def test_list_filters_status_and_tier(db):
     assert len(json.loads(r.output)) == 1
 
 
+def test_list_filters_by_role(db):
+    _seed(db, "Carol Founder", current_role="Founder & CEO", connection_status="in_network")
+    _seed(db, "Dan Eng", current_role="Staff Engineer", connection_status="in_network")
+    # case-insensitive substring on current_role
+    r = runner.invoke(app, ["list", "--role", "FOUNDER", "--json"])
+    rows = json.loads(r.output)
+    assert [x["full_name"] for x in rows] == ["Carol Founder"]
+    # composes with --status (AND): the contact_on_file founder is excluded
+    _seed(db, "Eve Founder", current_role="Founder", connection_status="contact_on_file")
+    r = runner.invoke(app, ["list", "--role", "founder", "--status", "in_network", "--json"])
+    rows = json.loads(r.output)
+    assert [x["full_name"] for x in rows] == ["Carol Founder"]
+
+
+def test_list_role_escapes_wildcards(db):
+    # a literal % in the query must NOT act as a SQL wildcard
+    _seed(db, "Frank Founder", current_role="Founder", connection_status="in_network")
+    r = runner.invoke(app, ["list", "--role", "f%under", "--json"])
+    assert r.exit_code == 0, r.output
+    assert json.loads(r.output) == []
+
+
 def test_set_validates_field_and_updates(db):
     c = _seed(db)
     r = runner.invoke(app, ["set", c["id"], "connection_status=in_network"])
@@ -42,6 +64,28 @@ def test_set_validates_field_and_updates(db):
     runner.invoke(app, ["tags", "add", "fundraising", "--desc", "raising a round"])
     r = runner.invoke(app, ["set", c["id"], "tags=fundraising"])
     assert r.exit_code == 0
+
+
+def test_set_last_enriched_at(db):
+    c = _seed(db)
+    r = runner.invoke(app, ["set", c["id"], "last_enriched_at=2026-06-14"])
+    assert r.exit_code == 0, r.output
+    row = (db.table("contacts").select("last_enriched_at")
+           .eq("id", c["id"]).single().execute().data)
+    assert row["last_enriched_at"] == "2026-06-14"
+    log = (db.table("enrichment_log").select("field")
+           .eq("contact_id", c["id"]).execute().data)
+    assert any(e["field"] == "last_enriched_at" for e in log)
+
+
+def test_set_last_enriched_at_rejects_malformed(db):
+    # date column → Postgres rejects a non-date value (does not store it)
+    c = _seed(db)
+    r = runner.invoke(app, ["set", c["id"], "last_enriched_at=banana"])
+    assert r.exit_code != 0
+    row = (db.table("contacts").select("last_enriched_at")
+           .eq("id", c["id"]).single().execute().data)
+    assert row["last_enriched_at"] is None
 
 
 def test_search_fuzzy(db):

@@ -46,6 +46,7 @@ crm sync-status                       # re-run after backfill; --dry-run to prev
 # Review & query
 crm review       # arbitrate ambiguous matches (--approve/--reject/--to)
 crm list --status in_network --cold-since 6   # who to reconnect with
+crm list --role founder --status in_network   # surface by role (substring on current_role)
 crm contact "<name>"                          # full context for drafting
 crm log / crm event add                       # record touchpoints manually
 
