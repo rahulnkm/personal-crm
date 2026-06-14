@@ -1,10 +1,11 @@
 """Golden-record commands. `contact` resolves a name or uuid; everything is --json-able."""
 import json
 import re
-from datetime import date, timedelta
+from datetime import date
 
 import typer
 
+from crm.bulk import _apply_filters
 from crm.commands.admin import require_agent
 from crm.config import get_client
 from crm.output import err, render
@@ -89,17 +90,8 @@ def list_contacts(
     q = client.table("contacts").select(
         "id,full_name,current_role,current_company,connection_status,"
         "closeness_tier,affiliations,tags,last_touchpoint_at")
-    if status:
-        q = q.eq("connection_status", status)
-    if tier:
-        q = q.eq("closeness_tier", tier)
-    if tag:
-        q = q.contains("tags", [tag])
-    if affiliation:
-        q = q.contains("affiliations", [affiliation])
-    if cold_since is not None:
-        cutoff = (date.today() - timedelta(days=30 * cold_since)).isoformat()
-        q = q.or_(f"last_touchpoint_at.lte.{cutoff},last_touchpoint_at.is.null")
+    q = _apply_filters(q, status=status, tier=tier, tag=tag,
+                       affiliation=affiliation, cold_since=cold_since)
     rows = q.order("last_touchpoint_at", desc=False, nullsfirst=True).limit(limit).execute().data
     render(rows, as_json)
 
