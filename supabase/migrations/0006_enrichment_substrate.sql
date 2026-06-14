@@ -62,7 +62,12 @@ create table if not exists candidate_identities (
 -- helper: recompute + materialize the winner for one scalar (contact, field)
 create or replace function enrich_recompute_field(p_contact_id uuid, p_field text)
 returns text language plpgsql as $$
-declare win record; begin
+declare win record; col_type text; begin
+  -- the golden column may be a non-text type (e.g. the connection_status enum);
+  -- provenance stores values as text, so materialization casts back to the
+  -- column's declared type (text->enum, text->date, text->text no-op).
+  select udt_name into col_type from information_schema.columns
+   where table_schema = 'public' and table_name = 'contacts' and column_name = p_field;
   select id, new_value into win
   from enrichment_log e
   where e.contact_id = p_contact_id and e.field = p_field
@@ -83,7 +88,8 @@ declare win record; begin
    where contact_id = p_contact_id and field = p_field and is_current;
   if win.id is not null then
     update enrichment_log set is_current = true where id = win.id;
-    execute format('update contacts set %I = $1, updated_at = now() where id = $2', p_field)
+    execute format('update contacts set %I = $1::text::%I, updated_at = now() where id = $2',
+                   p_field, col_type)
       using win.new_value, p_contact_id;
   else
     -- no surviving candidate (e.g. sole value was tombstoned) → clear the golden column

@@ -192,23 +192,31 @@ def set_field(
         raise typer.Exit(1)
     c = _resolve(client, ref)
     if field in ARRAY_FIELDS:
+        # arrays are set-union semantics, not survivorship — keep the direct path
         if field == "tags":
             known = client.table("tag_registry").select("tag").eq("tag", value).execute().data
             if not known:
                 err(f"Tag '{value}' not in registry. First: crm tags add {value} --desc '...'")
                 raise typer.Exit(1)
         new_array = sorted(set(c[field]) | {value})
-        update = {field: new_array}
-    else:
-        update = {field: value}
-    old = c.get(field)
-    update["updated_at"] = "now()"
-    client.table("contacts").update(update).eq("id", c["id"]).execute()
-    client.table("enrichment_log").insert(
-        {"contact_id": c["id"], "field": field, "old_value": str(old),
-         "new_value": str(update[field]), "source": agent, "method": "manual_set"}
-    ).execute()
-    typer.echo(f"{c['full_name']}: {field} = {update[field]}")
+        old = c.get(field)
+        update = {field: new_array, "updated_at": "now()"}
+        client.table("contacts").update(update).eq("id", c["id"]).execute()
+        client.table("enrichment_log").insert(
+            {"contact_id": c["id"], "field": field, "old_value": str(old),
+             "new_value": str(new_array), "source": agent, "method": "manual_set"}
+        ).execute()
+        typer.echo(f"{c['full_name']}: {field} = {new_array}")
+        return
+    # scalar: route through the survivorship RPC as a sacred manual write. A blank
+    # value (`field=`) is a deliberate NULL — manual_set NULL wins and clears the column.
+    p_value = value if value != "" else None
+    client.rpc("enrich_apply_candidate", {
+        "p_contact_id": c["id"], "p_field": field, "p_value": p_value,
+        "p_method": "manual_set", "p_source": agent, "p_confidence": 1.0,
+        "p_source_detail": None, "p_dry_run": False,
+    }).execute()
+    typer.echo(f"{c['full_name']}: {field} = {p_value}")
 
 
 def note(
