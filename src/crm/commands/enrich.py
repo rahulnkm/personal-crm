@@ -168,6 +168,35 @@ def _promote_identity(client, candidate_id: str, agent: str) -> None:
     typer.echo(f"promoted: {ci['kind']} = {ci['value']}")
 
 
+@enrich_app.command("changes")
+def changes(
+    since: str = typer.Option(..., "--since", help="ISO date/timestamp lower bound"),
+    as_json: bool = typer.Option(False, "--json"),
+):
+    """Job changes (company/role transitions) from the provenance trail since a date.
+
+    Reads `enrichment_log` directly — the RPC already records old->new on every
+    materialization, so there's no extra write path.
+    """
+    client = get_client()
+    rows = (client.table("enrichment_log")
+            .select("contact_id,field,old_value,new_value,created_at")
+            .in_("field", ["current_company", "current_role"])
+            .not_.is_("old_value", "null")
+            .gte("created_at", since)
+            .order("created_at", desc=True).execute().data)
+    # keep only genuine transitions (old != new); 'None'-text guards legacy str(None)
+    rows = [r for r in rows if r["old_value"] not in (None, "None")
+            and r["old_value"] != r["new_value"]]
+    out = [{"contact_id": r["contact_id"], "field": r["field"],
+            "old": r["old_value"], "new": r["new_value"], "at": r["created_at"]}
+           for r in rows]
+    if as_json:
+        typer.echo(json.dumps(out, default=str))
+    else:
+        render(out, False)
+
+
 def _method_for(agent: str) -> str:
     """Agent-authored enrichment is a derived method (never manual_set)."""
     return "enrich_agent"
