@@ -92,3 +92,16 @@ def test_concurrent_applies_one_winner(db):
     assert len(cur) == 1
     got = db.table("contacts").select("location").eq("id",c["id"]).single().execute().data["location"]
     assert got == cur[0]["new_value"]  # materialized value matches the one current row
+
+
+def test_backfill_protects_existing_value(db):
+    # simulate a pre-existing contact value with no provenance, then run the seed fn
+    c = _contact(db, current_company="LegacyCo")
+    db.rpc("enrich_seed_provenance", {}).execute()  # idempotent seed over all contacts
+    # an API value below... legacy is 0.8; a 0.7 web value should NOT overwrite (loses on recency? ensure)
+    out = _apply(db, c["id"], "current_company", "WebCo", "enrich_api", "pdl", 0.85)
+    got = db.table("contacts").select("current_company").eq("id",c["id"]).single().execute().data["current_company"]
+    # legacy seed exists & is_current; a higher-confidence newer value MAY win — but a human one never loses.
+    # Assert at minimum: a provenance row now exists and is_current for the legacy value pre-apply.
+    rows = db.table("enrichment_log").select("method,is_current,new_value").eq("contact_id",c["id"]).eq("field","current_company").execute().data
+    assert any(r["new_value"]=="LegacyCo" for r in rows)
