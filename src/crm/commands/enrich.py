@@ -197,6 +197,84 @@ def changes(
         render(out, False)
 
 
+@enrich_app.command("undo")
+def undo(
+    ref: str = typer.Argument(..., help="Contact name or uuid"),
+    field: str = typer.Argument(..., help="Scalar field to revert"),
+    agent: str = typer.Option("rahul", "--agent"),
+):
+    """Revert the current (robot) value for a field and re-elect the prior winner.
+
+    Tombstones the current value so it won't immediately re-win, then recomputes.
+    """
+    client = get_client()
+    require_agent(client, agent)
+    c = _resolve(client, ref)
+    cur = (client.table("enrichment_log").select("id,new_value")
+           .eq("contact_id", c["id"]).eq("field", field).eq("is_current", True)
+           .execute().data)
+    if not cur:
+        err(f"No current value for {field} on {c['full_name']}")
+        raise typer.Exit(1)
+    # dispute the current value so recompute skips it and elects the next-best
+    client.table("enrichment_log").update(
+        {"verification_status": "disputed", "is_current": False}).eq("id", cur[0]["id"]).execute()
+    client.rpc("enrich_recompute_field", {
+        "p_contact_id": c["id"], "p_field": field}).execute()
+    got = (client.table("contacts").select(field).eq("id", c["id"]).single().execute().data)
+    typer.echo(f"{c['full_name']}: {field} reverted to {got.get(field)!r}")
+
+
+@enrich_app.command("forget")
+def forget(
+    ref: str = typer.Argument(..., help="Contact name or uuid"),
+    agent: str = typer.Option("rahul", "--agent"),
+):
+    """Redact (right-to-be-forgotten) enrichment values for a contact, keeping the
+    structural provenance rows so the audit trail stays intact."""
+    client = get_client()
+    require_agent(client, agent)
+    c = _resolve(client, ref)
+    client.table("enrichment_log").update(
+        {"old_value": None, "new_value": None, "redacted_at": "now()"}
+    ).eq("contact_id", c["id"]).execute()
+    typer.echo(f"redacted enrichment values for {c['full_name']}")
+
+
+@enrich_app.command("stats")
+def stats(as_json: bool = typer.Option(False, "--json")):
+    """Enrichment coverage: current values by source, in-review queue, stale rows.
+    Head-count queries so counts stay exact past PostgREST's 1,000-row cap."""
+    client = get_client()
+    from datetime import date
+
+    def count_q(q) -> int:
+        return q.execute().count or 0
+
+    out = []
+    # in-review (open queue)
+    out.append({"metric": "in_review", "count": count_q(
+        client.table("enrich_review").select("id", count="exact", head=True).eq("status", "open"))})
+    # pending quarantined identifiers
+    out.append({"metric": "pending_identities", "count": count_q(
+        client.table("candidate_identities").select("id", count="exact", head=True).eq("status", "pending"))})
+    # stale: current rows whose refresh_after is in the past
+    out.append({"metric": "stale", "count": count_q(
+        client.table("enrichment_log").select("id", count="exact", head=True)
+        .eq("is_current", True).lt("refresh_after", date.today().isoformat()))})
+    # current values grouped by source (one head-count per distinct source)
+    cur_sources = (client.table("enrichment_log").select("source")
+                   .eq("is_current", True).execute().data)
+    by_source: dict[str, int] = {}
+    for r in cur_sources:
+        by_source[r["source"]] = by_source.get(r["source"], 0) + 1
+    for src, n in sorted(by_source.items()):
+        out.append({"metric": f"current_by_source={src}", "count": n})
+
+    out = [o for o in out if o["count"]]
+    render(out, as_json)
+
+
 def _method_for(agent: str) -> str:
     """Agent-authored enrichment is a derived method (never manual_set)."""
     return "enrich_agent"

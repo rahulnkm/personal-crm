@@ -8,7 +8,8 @@ alter table enrichment_log
   add column if not exists source_detail text,
   add column if not exists verification_status enrich_verification not null default 'unverified',
   add column if not exists refresh_after date,
-  add column if not exists is_current boolean not null default false;
+  add column if not exists is_current boolean not null default false,
+  add column if not exists redacted_at timestamptz;  -- `crm enrich forget` tombstone
 
 -- exactly one current scalar winner per (contact, field)
 create unique index if not exists enrichment_log_current_uq
