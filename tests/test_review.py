@@ -283,6 +283,65 @@ def test_n_invariance_review_display(db):
     )
 
 
+def test_identity_discovered_candidate_second_pass(db):
+    """Cover _prefetch_display_maps lines 411 and 415-422 (second-pass fetch).
+
+    Set up a contact C with an email identity but insert the staging row with
+    matched_contact_id=NULL.  _prefetch_display_maps first pass collects NO
+    contact_ids (matched_contact_id is NULL).  The identity-lookup pass finds C
+    via the email → line 411 fires (cid not in contact_map → contact_ids.add(cid)).
+    Lines 415-422 then fetch C in the second pass.
+    _candidate_display renders C's name, proving the path ran end-to-end.
+    """
+    from crm.commands.dedup import _candidate_display, _prefetch_display_maps
+    from crm.config import get_client
+
+    # Create a contact with a real (non-role) email identity
+    contact = db.table("contacts").insert(
+        {"full_name": "Diana Prince", "current_company": "WonderCo"}
+    ).execute().data[0]
+    db.table("contact_identities").insert(
+        {"contact_id": contact["id"], "source": "em", "email": "diana@wonder.co"}
+    ).execute()
+
+    # Staging row: matched_contact_id is NULL but email matches the identity above.
+    # This means the first-pass contact fetch skips contact["id"] entirely;
+    # only the identity lookup discovers it → second-pass fetch required.
+    row = db.table("staging").insert({
+        "source": "test_src",
+        "source_external_id": "second-pass-1",
+        "full_name": "Diana P",
+        "email": "diana@wonder.co",
+        "match_status": "needs_review",
+        "match_method": "conflicting_keys",
+        "match_confidence": 0.80,
+        "matched_contact_id": None,
+    }).execute().data[0]
+
+    client = get_client()
+    maps = _prefetch_display_maps(client, [row])
+
+    # The second-pass must have fetched the contact
+    assert contact["id"] in maps["contacts"], (
+        "second-pass fetch did not populate contact_map with identity-discovered contact"
+    )
+
+    result = _candidate_display(maps, row)
+    # Should render C's name, not <gone> or <no candidates>
+    assert "Diana Prince" in result, f"Expected candidate name in output, got: {result!r}"
+    assert "WonderCo" in result, f"Expected company in output, got: {result!r}"
+
+    # Also verify end-to-end via review list command
+    r = runner.invoke(app, ["review", "--json"])
+    assert r.exit_code == 0
+
+    import json
+    rows_out = json.loads(r.output)
+    by_id = {r_["id"]: r_ for r_ in rows_out}
+    assert row["id"] in by_id, "staging row missing from review output"
+    assert "Diana Prince" in by_id[row["id"]]["candidate"]
+
+
 def test_merge_and_split(db):
     a = db.table("contacts").insert({"full_name": "Ada L"}).execute().data[0]
     b = db.table("contacts").insert({"full_name": "Ada Lovelace"}).execute().data[0]
