@@ -20,6 +20,7 @@ LOCAL_ENV = Path(__file__).resolve().parent.parent / ".env.local"
 
 DATA_TABLES = [
     "staging_interactions",
+    "enrich_review", "candidate_identities",
     "enrichment_log", "interactions", "events", "staging",
     "contact_identities", "contacts", "tag_registry",
 ]
