@@ -67,6 +67,64 @@ def apply(
             typer.echo(f"{r['field']}: {r['outcome']}")
 
 
+@enrich_app.command("review")
+def review(
+    approve: str = typer.Option(None, "--approve", help="Review id to accept"),
+    reject: str = typer.Option(None, "--reject", help="Review id to reject (tombstone)"),
+    skip: str = typer.Option(None, "--skip", help="Review id to skip"),
+    agent: str = typer.Option("rahul", "--agent"),
+    as_json: bool = typer.Option(False, "--json"),
+):
+    """Arbitrate the enrichment review queue. Bare command lists open items."""
+    client = get_client()
+    actions = [a for a in (approve, reject, skip) if a]
+    if len(actions) > 1:
+        err("Pass only one of --approve / --reject / --skip")
+        raise typer.Exit(2)
+
+    if not actions:  # list open items
+        rows = (client.table("enrich_review")
+                .select("id,contact_id,field,candidate_value,source,confidence,reason,"
+                        "other_contact_id,created_at")
+                .eq("status", "open").order("created_at").execute().data)
+        render(rows, as_json)
+        return
+
+    require_agent(client, agent)
+    review_id = actions[0]
+    item = (client.table("enrich_review").select("*").eq("id", review_id).execute().data)
+    if not item:
+        err(f"No review item '{review_id}'")
+        raise typer.Exit(1)
+    item = item[0]
+
+    if approve:
+        client.rpc("enrich_apply_candidate", {
+            "p_contact_id": item["contact_id"], "p_field": item["field"],
+            "p_value": item["candidate_value"], "p_method": "manual_set",
+            "p_source": agent, "p_confidence": 1.0,
+            "p_source_detail": None, "p_dry_run": False}).execute()
+        client.table("enrich_review").update(
+            {"status": "resolved", "resolved_at": "now()"}).eq("id", review_id).execute()
+        typer.echo(f"approved: {item['field']} = {item['candidate_value']}")
+    elif reject:
+        # tombstone the (field, value): a disputed provenance row this value can
+        # never beat again, then re-elect a surviving winner.
+        client.table("enrichment_log").insert({
+            "contact_id": item["contact_id"], "field": item["field"],
+            "new_value": item["candidate_value"], "source": agent,
+            "method": "enrich_reject", "verification_status": "disputed"}).execute()
+        client.rpc("enrich_recompute_field", {
+            "p_contact_id": item["contact_id"], "p_field": item["field"]}).execute()
+        client.table("enrich_review").update(
+            {"status": "resolved", "resolved_at": "now()"}).eq("id", review_id).execute()
+        typer.echo(f"rejected (tombstoned): {item['field']} = {item['candidate_value']}")
+    else:  # skip
+        client.table("enrich_review").update(
+            {"status": "skipped", "resolved_at": "now()"}).eq("id", review_id).execute()
+        typer.echo(f"skipped: {review_id}")
+
+
 def _method_for(agent: str) -> str:
     """Agent-authored enrichment is a derived method (never manual_set)."""
     return "enrich_agent"
