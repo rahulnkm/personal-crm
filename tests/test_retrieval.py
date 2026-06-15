@@ -208,6 +208,30 @@ def test_find_union_structural_and_keyword(db):
     assert {"Ada Founder", "Cleo Chief"} <= names
 
 
+def test_find_keyword_matches_current_role(db):
+    # role/company-based intents must surface people off current_role even before
+    # company_category enrichment exists.
+    db.table("contacts").insert(
+        {"full_name": "Vera VC", "current_role": "Venture Partner",
+         "current_company": "Acme Capital",
+         "connection_status": "contact_on_file", "closeness_tier": "none"}).execute()
+    r = runner.invoke(app, ["find", "venture partner", "--json"])
+    assert r.exit_code == 0, r.output
+    names = {c["name"] for c in json.loads(r.output)["candidates"]}
+    assert "Vera VC" in names
+
+
+def test_find_keyword_matches_current_company(db):
+    db.table("contacts").insert(
+        {"full_name": "Cory Capital", "current_role": "Principal",
+         "current_company": "Sequoia Capital",
+         "connection_status": "contact_on_file", "closeness_tier": "none"}).execute()
+    r = runner.invoke(app, ["find", "sequoia investor", "--json"])
+    assert r.exit_code == 0, r.output
+    names = {c["name"] for c in json.loads(r.output)["candidates"]}
+    assert "Cory Capital" in names
+
+
 def test_find_no_match_empty_candidates(db):
     _seed(db)
     r = runner.invoke(app, ["find", "underwater basketweaving zzzzqqq", "--json"])

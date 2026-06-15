@@ -28,7 +28,7 @@ CAPSULE_COLS = (
 # capsule columns the keyword prefilter searches. Scalar text → substring (ilike);
 # text[] → element-contains (cs), since ilike can't apply to an array. (topics live
 # in interactions.summary — searched separately, they're not a contacts column.)
-FIND_TEXT_COLS = ["company_category", "notes"]
+FIND_TEXT_COLS = ["company_category", "notes", "current_role", "current_company"]
 FIND_ARRAY_COLS = ["expertise", "tags"]
 # common words that carry no retrieval signal — dropped from intent tokenization.
 STOPWORDS = {
