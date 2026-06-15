@@ -67,6 +67,197 @@ def apply(
             typer.echo(f"{r['field']}: {r['outcome']}")
 
 
+# closeness priority: t1 first … none last. in_network beats contact_on_file within a tier.
+_TIER_RANK = {"t1_irl_messaging": 0, "t2_dm": 1, "t3_community": 2,
+              "t4_public": 3, "none": 4}
+# per-source minimum seconds between calls (spec §6.2 — throughput/safety, not cost).
+_SOURCE_MIN_INTERVAL = {"gravatar": 60 / 50, "github": 60 / 10}
+# fields a source produces that map to a contacts column (only-missing gap check).
+# identifier fields (email/etc.) are never "missing-on-contacts", so we only check
+# the attribute fields a source can fill.
+_RUN_COLS = ("current_role", "current_company", "location", "company_category",
+             "avatar_url", "github_username", "twitter_username", "website_url")
+
+
+@enrich_app.command("run")
+def run(
+    sources: str = typer.Option(None, "--sources",
+                                help="Comma list (default: all): gravatar,github"),
+    status: str = typer.Option("in_network", "--status",
+                               help="connection_status filter (default in_network)"),
+    tier: str = typer.Option(None, "--tier", help="Comma list of closeness tiers"),
+    limit: int = typer.Option(None, "--limit", help="Cap contacts processed (batching)"),
+    dry_run: bool = typer.Option(False, "--dry-run", help="Compute outcomes, write nothing"),
+    only_missing: bool = typer.Option(
+        True, "--only-missing/--no-only-missing",
+        help="Skip contacts already enriched or with no gaps a source would fill"),
+    as_json: bool = typer.Option(False, "--json"),
+):
+    """Fetch deterministic public signal (Gravatar/GitHub) and apply via the RPC.
+
+    Walks the network closeness-first (t1 > t2 > … > none), runs each selected source
+    on the contact's primary email, and funnels every Candidate through
+    enrich_apply_candidate (method=enrich_api, source=<plugin>). Sets
+    contacts.last_enriched_at on success (unless --dry-run). Per-contact status is
+    always reported — never a silent skip.
+    """
+    from datetime import date
+
+    from crm.sources import select_sources
+
+    client = get_client()
+    selected = select_sources(sources.split(",") if sources else None)
+    if not selected:
+        err(f"No known sources in {sources!r}; available: gravatar, github")
+        raise typer.Exit(2)
+
+    contacts = _candidate_contacts(client, status, tier)
+    contacts.sort(key=lambda c: (
+        _TIER_RANK.get(c.get("closeness_tier"), 99),
+        0 if c.get("connection_status") == "in_network" else 1,
+        c.get("full_name") or ""))
+
+    limiter = _RateLimiter()
+    results: list[dict] = []
+    processed = 0
+    today = date.today().isoformat()
+    summary = {"contacts": 0, "enriched_contacts": 0, "enriched_fields": 0,
+               "skipped": 0, "no_email": 0, "no_signal": 0, "errors": 0,
+               "dry_run": dry_run}
+
+    for c in contacts:
+        if limit is not None and processed >= limit:
+            break
+
+        email = _primary_email(client, c["id"])
+        produced_fields = set().union(*[s.produces for s in selected])
+        if only_missing and _already_satisfied(c, produced_fields):
+            results.append({"contact_id": c["id"], "name": c["full_name"],
+                            "status": "skipped", "fields": 0})
+            summary["skipped"] += 1
+            continue
+        if not email:
+            results.append({"contact_id": c["id"], "name": c["full_name"],
+                            "status": "no_email", "fields": 0})
+            summary["no_email"] += 1
+            continue
+
+        processed += 1
+        summary["contacts"] += 1
+        fields_written = 0
+        errored = False
+        for src in selected:
+            limiter.wait(src.name)
+            try:
+                cands = src.fetch(email)
+            except Exception as exc:  # a source must never abort the contact
+                err(f"{c['full_name']}: source {src.name} error: {exc}")
+                errored = True
+                continue
+            for cand in cands:
+                outcome = client.rpc("enrich_apply_candidate", {
+                    "p_contact_id": c["id"], "p_field": cand.field,
+                    "p_value": cand.value, "p_method": "enrich_api",
+                    "p_source": src.name, "p_confidence": cand.confidence,
+                    "p_source_detail": cand.source_detail, "p_dry_run": dry_run,
+                }).execute().data
+                if outcome == "golden":
+                    fields_written += 1
+
+        if not dry_run:
+            client.table("contacts").update(
+                {"last_enriched_at": today}).eq("id", c["id"]).execute()
+
+        if errored and fields_written == 0:
+            status_label = "error"
+            summary["errors"] += 1
+        elif fields_written:
+            status_label = "enriched"
+            summary["enriched_contacts"] += 1
+            summary["enriched_fields"] += fields_written
+        else:
+            status_label = "no_signal"
+            summary["no_signal"] += 1
+
+        results.append({"contact_id": c["id"], "name": c["full_name"],
+                        "status": status_label, "fields": fields_written})
+
+    if as_json:
+        typer.echo(json.dumps({"summary": summary, "contacts": results}, default=str))
+    else:
+        for r in results:
+            typer.echo(f"{r['name']}: {r['status']}"
+                       + (f" ({r['fields']} fields)" if r["fields"] else ""))
+        typer.echo(
+            f"— {summary['enriched_contacts']} enriched "
+            f"({summary['enriched_fields']} fields), {summary['skipped']} skipped, "
+            f"{summary['no_email']} no-email, {summary['no_signal']} no-signal, "
+            f"{summary['errors']} errors"
+            + (" [dry-run]" if dry_run else ""))
+
+
+def _candidate_contacts(client, status: str | None, tier: str | None) -> list[dict]:
+    cols = ("id,full_name,connection_status,closeness_tier,last_enriched_at,"
+            + ",".join(_RUN_COLS))
+    q = client.table("contacts").select(cols)
+    if status:
+        q = q.eq("connection_status", status)
+    if tier:
+        tiers = [t.strip() for t in tier.split(",") if t.strip()]
+        if tiers:
+            q = q.in_("closeness_tier", tiers)
+    # page past the 1,000-row PostgREST cap
+    rows: list[dict] = []
+    start = 0
+    while True:
+        page = q.order("id").range(start, start + 999).execute().data
+        rows.extend(page)
+        if len(page) < 1000:
+            break
+        start += 1000
+    return rows
+
+
+def _primary_email(client, contact_id: str) -> str | None:
+    """First non-null email across the contact's identities."""
+    rows = (client.table("contact_identities").select("email")
+            .eq("contact_id", contact_id).not_.is_("email", "null")
+            .order("imported_at").execute().data)
+    return rows[0]["email"] if rows else None
+
+
+def _already_satisfied(contact: dict, produced_fields: set[str]) -> bool:
+    """only-missing gate: skip if already enriched, or every attribute field the
+    selected sources could fill is already populated on the golden record."""
+    if contact.get("last_enriched_at"):
+        return True
+    gap_fields = [f for f in produced_fields if f in _RUN_COLS]
+    if not gap_fields:
+        return False
+    return all(contact.get(f) for f in gap_fields)
+
+
+class _RateLimiter:
+    """Per-source minimum-interval gate (throughput/safety). Sleeps only as long as
+    needed since the last call for that source."""
+
+    def __init__(self):
+        self._last: dict[str, float] = {}
+
+    def wait(self, name: str) -> None:
+        import time
+        interval = _SOURCE_MIN_INTERVAL.get(name, 0)
+        if interval <= 0:
+            return
+        now = time.monotonic()
+        last = self._last.get(name)
+        if last is not None:
+            delay = interval - (now - last)
+            if delay > 0:
+                time.sleep(delay)
+        self._last[name] = time.monotonic()
+
+
 @enrich_app.command("review")
 def review(
     approve: str = typer.Option(None, "--approve", help="Review id to accept"),

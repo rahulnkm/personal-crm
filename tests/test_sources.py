@@ -86,12 +86,29 @@ def test_gravatar_no_avatar_no_profile_returns_empty():
 
 
 @respx.mock
-def test_gravatar_rate_limited_returns_empty_not_crash():
+def test_gravatar_rate_limited_returns_empty_not_crash(monkeypatch):
+    monkeypatch.setattr("crm.sources.time.sleep", lambda *_: None)  # don't actually wait
     h = gravatar_hash("ada@example.com")
-    respx.head(f"https://gravatar.com/avatar/{h}").mock(return_value=httpx.Response(429))
+    avatar = respx.head(f"https://gravatar.com/avatar/{h}").mock(
+        return_value=httpx.Response(429))
     respx.get(f"https://api.gravatar.com/v3/profiles/{h}").mock(
         return_value=httpx.Response(429))
     assert GravatarSource().fetch("ada@example.com") == []
+    # exhausted retries (1 initial + _MAX_RETRIES) before degrading
+    from crm.sources import _MAX_RETRIES
+    assert avatar.call_count == _MAX_RETRIES + 1
+
+
+@respx.mock
+def test_gravatar_429_then_success_retries(monkeypatch):
+    monkeypatch.setattr("crm.sources.time.sleep", lambda *_: None)
+    h = gravatar_hash("ada@example.com")
+    respx.head(f"https://gravatar.com/avatar/{h}").mock(return_value=httpx.Response(404))
+    # first profile call 429, second succeeds → backoff recovers
+    respx.get(f"https://api.gravatar.com/v3/profiles/{h}").mock(side_effect=[
+        httpx.Response(429), httpx.Response(200, json=GRAVATAR_PROFILE)])
+    cands = GravatarSource().fetch("ada@example.com")
+    assert any(c.field == "location" for c in cands)
 
 
 @respx.mock

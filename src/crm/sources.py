@@ -18,7 +18,9 @@ from __future__ import annotations
 import hashlib
 import logging
 import os
+import random
 import re
+import time
 from typing import NamedTuple
 
 import httpx
@@ -43,6 +45,34 @@ class Candidate(NamedTuple):
     source_detail: str | None = None
 
 
+# HTTP 429 backoff (spec §6.2): honor Retry-After, else exponential + jitter, capped.
+_MAX_RETRIES = 3
+_BACKOFF_CAP = 60.0
+
+
+def _request(method: str, url: str, **kw) -> httpx.Response | None:
+    """One HTTP call with bounded 429 backoff. Returns the response (any non-429
+    status) or None on exhausted retries / network error. Never raises."""
+    attempt = 0
+    while True:
+        try:
+            r = httpx.request(method, url, timeout=TIMEOUT, follow_redirects=True, **kw)
+        except httpx.HTTPError as exc:
+            log.warning("%s %s failed: %s", method, url, exc)
+            return None
+        if r.status_code != 429 or attempt >= _MAX_RETRIES:
+            return r
+        retry_after = r.headers.get("Retry-After")
+        if retry_after and retry_after.isdigit():
+            delay = min(float(retry_after), _BACKOFF_CAP)
+        else:
+            delay = min(2.0 ** attempt + random.random(), _BACKOFF_CAP)
+        log.warning("%s %s → 429, backoff %.1fs (attempt %d)", method, url, delay,
+                    attempt + 1)
+        time.sleep(delay)
+        attempt += 1
+
+
 def gravatar_hash(email: str) -> str:
     """Gravatar identity hash: SHA256 of the trimmed, lowercased email (spec §6.1)."""
     return hashlib.sha256(email.strip().lower().encode()).hexdigest()
@@ -52,6 +82,8 @@ class GravatarSource:
     """Gravatar avatar + profile. No auth. Self-published signal."""
 
     name = "gravatar"
+    produces = {"avatar_url", "location", "current_company", "current_role",
+                "twitter_username", "website_url"}
 
     def fetch(self, email: str) -> list[Candidate]:
         if not email or "@" not in email:
@@ -61,26 +93,20 @@ class GravatarSource:
 
         avatar_url = f"https://gravatar.com/avatar/{h}"
         # ?d=404 → HEAD returns 200 only when a real avatar exists (else 404).
-        try:
-            r = httpx.head(avatar_url, params={"d": "404"}, timeout=TIMEOUT,
-                           follow_redirects=True)
-            if r.status_code == 200:
-                out.append(Candidate("avatar_url", avatar_url, GRAVATAR_CONFIDENCE,
-                                     avatar_url))
-        except httpx.HTTPError as exc:
-            log.warning("gravatar avatar probe failed for %s: %s", h, exc)
+        r = _request("HEAD", avatar_url, params={"d": "404"})
+        if r is not None and r.status_code == 200:
+            out.append(Candidate("avatar_url", avatar_url, GRAVATAR_CONFIDENCE,
+                                 avatar_url))
 
         profile_url = f"https://api.gravatar.com/v3/profiles/{h}"
-        try:
-            r = httpx.get(profile_url, timeout=TIMEOUT, follow_redirects=True)
-            if r.status_code == 200:
+        r = _request("GET", profile_url)
+        if r is not None and r.status_code == 200:
+            try:
                 out += self._map_profile(r.json(), profile_url)
-            elif r.status_code not in (404,):
-                log.warning("gravatar profile %s → HTTP %s", h, r.status_code)
-        except httpx.HTTPError as exc:
-            log.warning("gravatar profile fetch failed for %s: %s", h, exc)
-        except ValueError as exc:  # malformed JSON
-            log.warning("gravatar profile parse failed for %s: %s", h, exc)
+            except ValueError as exc:  # malformed JSON
+                log.warning("gravatar profile parse failed for %s: %s", h, exc)
+        elif r is not None and r.status_code != 404:
+            log.warning("gravatar profile %s → HTTP %s", h, r.status_code)
 
         return out
 
@@ -134,6 +160,8 @@ class GitHubSource:
     """GitHub user profile. Token-optional. Self-published signal."""
 
     name = "github"
+    produces = {"github_username", "avatar_url", "current_company", "location",
+                "website_url", "twitter_username"}
 
     def fetch(self, email: str) -> list[Candidate]:
         if not email or "@" not in email:
@@ -157,16 +185,16 @@ class GitHubSource:
         return m.group("user") if m else None
 
     def _login_from_search(self, email: str, token: str) -> str | None:
-        try:
-            r = httpx.get("https://api.github.com/search/users",
-                          params={"q": email}, headers=self._headers(token),
-                          timeout=TIMEOUT)
-            if r.status_code != 200:
+        r = _request("GET", "https://api.github.com/search/users",
+                     params={"q": email}, headers=self._headers(token))
+        if r is None or r.status_code != 200:
+            if r is not None:
                 log.warning("github search → HTTP %s", r.status_code)
-                return None
+            return None
+        try:
             data = r.json()
-        except (httpx.HTTPError, ValueError) as exc:
-            log.warning("github search failed for %s: %s", email, exc)
+        except ValueError as exc:
+            log.warning("github search parse failed for %s: %s", email, exc)
             return None
         # email search is fuzzy — trust the login ONLY on an exact single match.
         if data.get("total_count") == 1 and data.get("items"):
@@ -175,14 +203,15 @@ class GitHubSource:
 
     def _fetch_user(self, login: str, token: str | None) -> list[Candidate]:
         url = f"https://api.github.com/users/{login}"
-        try:
-            r = httpx.get(url, headers=self._headers(token), timeout=TIMEOUT)
-            if r.status_code != 200:
+        r = _request("GET", url, headers=self._headers(token))
+        if r is None or r.status_code != 200:
+            if r is not None:
                 log.warning("github user %s → HTTP %s", login, r.status_code)
-                return []
+            return []
+        try:
             u = r.json()
-        except (httpx.HTTPError, ValueError) as exc:
-            log.warning("github user fetch failed for %s: %s", login, exc)
+        except ValueError as exc:
+            log.warning("github user parse failed for %s: %s", login, exc)
             return []
 
         out: list[Candidate] = [
