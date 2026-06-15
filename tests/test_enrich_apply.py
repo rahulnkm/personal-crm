@@ -80,6 +80,19 @@ def test_apply_company_alias_writes_current_company(db):
     assert db.table("contacts").select("current_company").eq("id", c["id"]).single().execute().data["current_company"] == "Bevy"
 
 
+def test_apply_array_field_routes_to_array_rpc(db):
+    # an attribute that is an ARRAY field must land in the array column via
+    # enrich_apply_array (set-union), not silently no-op on the scalar RPC.
+    db.table("agents").upsert({"id": "claude-web", "description": "test"}, on_conflict="id").execute()
+    c = db.table("contacts").insert({"full_name": "Exp Person"}).execute().data[0]
+    r = runner.invoke(app, ["enrich", "apply", c["id"], "--agent", "claude-web", "--json"],
+                      input='{"field":"expertise","value":"role:investor","confidence":0.9,"source":"agent:claude-web"}')
+    assert r.exit_code == 0, r.output
+    assert "added" in r.output
+    got = db.table("contacts").select("expertise").eq("id", c["id"]).single().execute().data["expertise"]
+    assert got == ["role:investor"]
+
+
 def test_apply_unknown_field_fails_cleanly(db):
     # a genuinely unknown field must fail with a clear message, not a raw 22004
     db.table("agents").upsert({"id": "claude-web", "description": "test"}, on_conflict="id").execute()

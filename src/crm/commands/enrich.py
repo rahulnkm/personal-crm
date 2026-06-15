@@ -15,7 +15,7 @@ import typer
 from crm.commands.admin import require_agent
 from crm.commands.contacts import _resolve
 from crm.config import get_client
-from crm.enrich import ATTRIBUTE, IDENTIFIER, EnrichCandidate, parse_payload
+from crm.enrich import ARRAY_FIELDS, ATTRIBUTE, IDENTIFIER, EnrichCandidate, parse_payload
 from crm.output import err, render
 
 enrich_app = typer.Typer(help="Provenance-tracked enrichment: apply, review, undo, stats.")
@@ -50,7 +50,10 @@ def apply(
     results = []
     for cand in candidates:
         if cand.kind == ATTRIBUTE:
-            outcome = client.rpc("enrich_apply_candidate", {
+            # array attributes (expertise/interests/tags/affiliations) accumulate via
+            # the set-union RPC; scalar attributes go through survivorship.
+            rpc = "enrich_apply_array" if cand.field in ARRAY_FIELDS else "enrich_apply_candidate"
+            outcome = client.rpc(rpc, {
                 "p_contact_id": c["id"], "p_field": cand.field, "p_value": cand.value,
                 "p_method": _method_for(agent), "p_source": cand.source or agent,
                 "p_confidence": cand.confidence, "p_source_detail": cand.source_detail,
@@ -307,13 +310,20 @@ def review(
         typer.echo(f"approved: {item['field']} = {item['candidate_value']}")
     elif reject:
         # tombstone the (field, value): a disputed provenance row this value can
-        # never beat again, then re-elect a surviving winner.
-        client.table("enrichment_log").insert({
-            "contact_id": item["contact_id"], "field": item["field"],
-            "new_value": item["candidate_value"], "source": agent,
-            "method": "enrich_reject", "verification_status": "disputed"}).execute()
-        client.rpc("enrich_recompute_field", {
-            "p_contact_id": item["contact_id"], "p_field": item["field"]}).execute()
+        # never beat again. Array fields have no single winner, so route to the
+        # array reject (writes disputed row + removes the element); scalars
+        # tombstone then re-elect a surviving winner.
+        if item["field"] in ARRAY_FIELDS:
+            client.rpc("enrich_reject_array", {
+                "p_contact_id": item["contact_id"], "p_field": item["field"],
+                "p_value": item["candidate_value"]}).execute()
+        else:
+            client.table("enrichment_log").insert({
+                "contact_id": item["contact_id"], "field": item["field"],
+                "new_value": item["candidate_value"], "source": agent,
+                "method": "enrich_reject", "verification_status": "disputed"}).execute()
+            client.rpc("enrich_recompute_field", {
+                "p_contact_id": item["contact_id"], "p_field": item["field"]}).execute()
         client.table("enrich_review").update(
             {"status": "resolved", "resolved_at": "now()"}).eq("id", review_id).execute()
         typer.echo(f"rejected (tombstoned): {item['field']} = {item['candidate_value']}")

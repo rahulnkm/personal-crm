@@ -12,9 +12,9 @@ from crm.output import err, render
 SETTABLE = {
     "connection_status", "closeness_tier", "current_role", "current_company",
     "location", "origin_context", "email_status", "full_name",
-    "affiliations", "tags",
+    "affiliations", "tags", "expertise", "interests",
 }
-ARRAY_FIELDS = {"affiliations", "tags"}
+ARRAY_FIELDS = {"affiliations", "tags", "expertise", "interests"}
 
 ENUM_VALUES = {
     "connection_status": {"in_network", "contact_on_file"},
@@ -320,20 +320,20 @@ def set_field(
         raise typer.Exit(1)
     c = _resolve(client, ref)
     if field in ARRAY_FIELDS:
-        # arrays are set-union semantics, not survivorship — keep the direct path
+        # arrays are set-union semantics, not survivorship — route through the
+        # array RPC (per-element, provenance-tracked) as a sacred manual write.
         if field == "tags":
             known = client.table("tag_registry").select("tag").eq("tag", value).execute().data
             if not known:
                 err(f"Tag '{value}' not in registry. First: crm tags add {value} --desc '...'")
                 raise typer.Exit(1)
-        new_array = sorted(set(c[field]) | {value})
-        old = c.get(field)
-        update = {field: new_array, "updated_at": "now()"}
-        client.table("contacts").update(update).eq("id", c["id"]).execute()
-        client.table("enrichment_log").insert(
-            {"contact_id": c["id"], "field": field, "old_value": str(old),
-             "new_value": str(new_array), "source": agent, "method": "manual_set"}
-        ).execute()
+        client.rpc("enrich_apply_array", {
+            "p_contact_id": c["id"], "p_field": field, "p_value": value,
+            "p_method": "manual_set", "p_source": agent, "p_confidence": 1.0,
+            "p_source_detail": None, "p_dry_run": False,
+        }).execute()
+        new_array = (client.table("contacts").select(field)
+                     .eq("id", c["id"]).single().execute().data[field])
         typer.echo(f"{c['full_name']}: {field} = {new_array}")
         return
     # scalar: route through the survivorship RPC as a sacred manual write. A blank
