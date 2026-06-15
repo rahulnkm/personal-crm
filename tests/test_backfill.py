@@ -1,7 +1,10 @@
 # tests/test_backfill.py
+from unittest.mock import patch
+
 from typer.testing import CliRunner
 
 from crm.cli import app
+from tests._spy import CountingClient
 
 runner = CliRunner()
 
@@ -123,3 +126,132 @@ def test_workers_one_behaves_identically(db):
         "id", inter[0]["contact_id"]).single().execute().data
     assert c["closeness_tier"] == "t1_irl_messaging"
     assert c["last_touchpoint_at"] == "2026-05-01"
+
+
+# ---------------------------------------------------------------------------
+# Task 1.2 — bulk_upsert_interactions contract tests
+# ---------------------------------------------------------------------------
+
+def test_reimport_refresh_no_duplicate_kind_preserved(db):
+    """Re-staging the same (source, source_external_id) with a changed summary
+    must produce exactly ONE interaction row; summary updated; kind/channel/
+    logged_by unchanged from the first import."""
+    c = _contact_with_identity(db, "Ada", email="a@b.co")
+    row = _stage_tp(db, email="a@b.co", occurred_at="2026-05-01",
+                    summary="first import", kind="message", channel="imessage")
+    runner.invoke(app, ["backfill"])
+    inter_before = db.table("interactions").select("*").eq("contact_id", c["id"]).execute().data
+    assert len(inter_before) == 1
+    original_kind = inter_before[0]["kind"]
+    original_channel = inter_before[0]["channel"]
+    original_logged_by = inter_before[0]["logged_by"]
+
+    # Same source + source_external_id, but summary changed — re-pend it
+    db.table("staging_interactions").update(
+        {"match_status": "pending", "summary": "updated summary"}
+    ).eq("id", row["id"]).execute()
+    runner.invoke(app, ["backfill"])
+
+    inter_after = db.table("interactions").select("*").eq("contact_id", c["id"]).execute().data
+    assert len(inter_after) == 1, "must not duplicate on re-import"
+    assert inter_after[0]["summary"] == "updated summary"
+    assert inter_after[0]["kind"] == original_kind
+    assert inter_after[0]["channel"] == original_channel
+    assert inter_after[0]["logged_by"] == original_logged_by
+
+
+def test_denorm_healed_when_interaction_moves_to_new_contact(db):
+    """If the same external touchpoint re-matches to contact B instead of A,
+    contact A's denorm (last_touchpoint_*) must be recomputed and cleared
+    (A had only that one interaction)."""
+    # contact A matched by email=a@b.co
+    a = _contact_with_identity(db, "Alice", email="a@b.co")
+    # contact B matched by email=b@b.co
+    b = _contact_with_identity(db, "Bob", email="b@b.co")
+
+    # Stage a touchpoint that matches A via email
+    row = _stage_tp(db, email="a@b.co", occurred_at="2026-05-01",
+                    summary="moves later", source_external_id="move-test-1")
+    runner.invoke(app, ["backfill"])
+
+    a_before = db.table("contacts").select("last_touchpoint_at").eq(
+        "id", a["id"]).single().execute().data
+    assert a_before["last_touchpoint_at"] == "2026-05-01"
+
+    # Re-point: change staging row to match B instead, reset to pending
+    db.table("staging_interactions").update(
+        {"match_status": "pending", "email": "b@b.co"}
+    ).eq("id", row["id"]).execute()
+    runner.invoke(app, ["backfill"])
+
+    # A had only this interaction — after moving, A's last_touchpoint_at is gone
+    a_after = db.table("contacts").select("last_touchpoint_at").eq(
+        "id", a["id"]).single().execute().data
+    assert a_after["last_touchpoint_at"] is None, (
+        "contact A must be recomputed after its only interaction was re-pointed to B"
+    )
+
+    # B now has the interaction
+    b_after = db.table("contacts").select("last_touchpoint_at").eq(
+        "id", b["id"]).single().execute().data
+    assert b_after["last_touchpoint_at"] == "2026-05-01"
+
+
+def test_no_per_row_update_uses_bulk_rpc(db):
+    """Round-trip regression: backfill must call bulk_upsert_interactions and
+    never issue a per-row interactions.update — even when rows already exist
+    (the refresh path).  N-invariance: 1 existing row and 3 existing rows both
+    produce 0 interactions.update calls."""
+    spy = CountingClient(db)
+
+    def make_spy():
+        return spy
+
+    _contact_with_identity(db, "Ada", email="ada@b.co")
+    # Stage 3 touchpoints then run once so they already exist in interactions
+    for i in range(3):
+        _stage_tp(db, email="ada@b.co", occurred_at=f"2026-0{i+1}-01",
+                  summary=f"touch {i}", source_external_id=f"spy-ext-{i}")
+    runner.invoke(app, ["backfill"])  # first run — inserts all 3
+
+    # Reset to pending so the next run takes the refresh path
+    db.table("staging_interactions").update({"match_status": "pending"}).like(
+        "source_external_id", "spy-ext-%").execute()
+
+    spy.calls.clear()  # reset counter before the observed run
+    with patch("crm.commands.backfill.get_client", make_spy):
+        r = runner.invoke(app, ["backfill", "--workers", "1"])
+    assert r.exit_code == 0, r.output
+
+    assert spy.rpc_count("bulk_upsert_interactions") >= 1, (
+        "bulk_upsert_interactions RPC must be called"
+    )
+    assert spy.count("interactions", "update") == 0, (
+        "per-row interactions.update must be 0 — all refreshes go through the RPC"
+    )
+
+
+def test_orphan_rows_excluded_from_bulk_upsert_patched_orphaned(db):
+    """Orphaned rows (no match) must NOT appear in the bulk_upsert payload and
+    their staging row must end up with match_status='orphaned'."""
+    # One matchable contact and one ghost email with no contact
+    _contact_with_identity(db, "Ada", email="linked@b.co")
+    _stage_tp(db, email="linked@b.co", occurred_at="2026-05-01",
+              summary="linked", source_external_id="orphan-test-linked")
+    _stage_tp(db, email="ghost@nowhere.example", occurred_at="2026-05-01",
+              summary="orphan", source_external_id="orphan-test-ghost")
+
+    spy = CountingClient(db)
+
+    with patch("crm.commands.backfill.get_client", lambda: spy):
+        r = runner.invoke(app, ["backfill", "--workers", "1"])
+    assert r.exit_code == 0, r.output
+
+    # Ghost row must be marked orphaned in staging
+    ghost_staging = db.table("staging_interactions").select("match_status").eq(
+        "source_external_id", "orphan-test-ghost").execute().data
+    assert ghost_staging[0]["match_status"] == "orphaned"
+
+    # Only one interaction must exist (the linked one)
+    inter = db.table("interactions").select("id").execute().data
+    assert len(inter) == 1

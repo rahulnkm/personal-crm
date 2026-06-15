@@ -11,8 +11,14 @@ import re
 import unicodedata
 
 from crm.matching import REVIEW_BAND
+from crm.output import err
 
 CLUSTER_KEYS = ("email", "phone", "linkedin_url", "handle")
+
+# Trigram buckets larger than this are skipped in the name-similarity pass to
+# avoid O(k²) blowup from ultra-common trigrams (e.g. "  s" shared by every
+# name starting with "S").  Exact-key buckets are never capped.
+MAX_BUCKET = 200
 
 
 # stroked/barred Latin letters have no NFKD decomposition; Postgres unaccent
@@ -84,7 +90,11 @@ def cluster_rows(rows: list[dict]) -> dict[str, list[dict]]:
             tri_index.setdefault(g, []).append(r["id"])
 
     checked: set[tuple[str, str]] = set()
+    skipped = 0
     for ids in tri_index.values():
+        if len(ids) > MAX_BUCKET:
+            skipped += 1
+            continue
         for i in range(len(ids)):
             for j in range(i + 1, len(ids)):
                 a, b = sorted((ids[i], ids[j]))
@@ -94,6 +104,11 @@ def cluster_rows(rows: list[dict]) -> dict[str, list[dict]]:
                 ta, tb = tri_of[a], tri_of[b]
                 if len(ta & tb) / len(ta | tb) >= REVIEW_BAND:
                     uf.union(a, b)
+    if skipped:
+        err(
+            f"clustering: skipped {skipped} oversized trigram bucket(s) (>200); "
+            "rare-trigram edges still applied"
+        )
 
     clusters: dict[str, list[dict]] = {}
     for r in rows:

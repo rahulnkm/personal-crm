@@ -33,24 +33,6 @@ def _load_pending(client):
             return out
 
 
-def _attach_identity(client, identity: dict, contact_id: str) -> bool:
-    """Reproduce sequential _attach EXACTLY: select-first identity guard incl. the
-    rerun_conflict branch; fill-null UPDATE; conflict-log. Returns False on conflict
-    (caller must route the row to needs_review/rerun_conflict, NOT auto_matched)."""
-    existing = []
-    if identity.get("source_external_id"):
-        existing = (client.table("contact_identities").select("id,contact_id")
-                    .eq("source", identity["source"])
-                    .eq("source_external_id", identity["source_external_id"]).execute().data)
-    if existing:
-        if existing[0]["contact_id"] != contact_id:
-            return False                                  # rerun_conflict
-    else:
-        client.table("contact_identities").insert(
-            {"contact_id": contact_id, **{f: identity.get(f) for f in IDENTITY_FIELDS}}).execute()
-    return True
-
-
 def _fill_and_log(client, contact_id, staged, source):
     contact = client.table("contacts").select("*").eq("id", contact_id).single().execute().data
     updates, conflicts = {}, []
@@ -91,6 +73,64 @@ def _bump(state, lock, key):
         state[key] += 1
 
 
+def _fold_auto(auto, deref, contact_by_id, existing):
+    """PURE in-memory replay of the sequential auto_matched path (no DB).
+
+    Walks `auto` items in plan order and reproduces _attach_identity + _fill_and_log
+    serial semantics against an in-memory per-contact accumulator, so later items in a
+    cluster see earlier items' fills (the load-bearing cross-item guarantee).
+
+    Args:
+        auto: auto_matched plan items, in PLAN ORDER.
+        deref: create_key→uuid resolver (identity for already-real uuids).
+        contact_by_id: {contact_uuid: contact-row dict} for every dereferenced target.
+        existing: {(source, source_external_id): contact_id} prefetched DB identity map.
+
+    Returns:
+        id_inserts: list of contact_identities rows to insert-or-ignore.
+        enrich_rows: list of enrichment_log rows (import_conflict).
+        fills: {contact_id: {field: value}} fill-null updates, one per contact.
+        outcomes: {item_id: "attached" | "conflict"}.
+    """
+    acc = {cid: dict(row) for cid, row in contact_by_id.items()}  # mutable per-contact state
+    seen_identities = dict(existing)              # DB map + in-cluster queued inserts
+    id_inserts, enrich_rows, fills, outcomes = [], [], {}, {}
+    for it in auto:
+        cid = deref(it["matched_ref"])
+        ident = it["identity"]
+        staged = it["staged"]
+        k = (ident.get("source"), ident.get("source_external_id"))
+        if ident.get("source_external_id") and k in seen_identities:
+            if seen_identities[k] != cid:
+                outcomes[it["id"]] = "conflict"      # identity lives on another contact
+                continue
+            # same contact: no re-insert; fall through to fill
+        elif ident.get("source_external_id"):
+            id_inserts.append({"contact_id": cid,
+                               **{f: ident.get(f) for f in IDENTITY_FIELDS}})
+            seen_identities[k] = cid
+        # FILL against the accumulator (mirrors the per-item DB re-read), write-back so
+        # later items in this cluster see what earlier items filled.
+        for cf, sf in FILL.items():
+            new = staged.get(sf)
+            if not new:
+                continue
+            if not acc[cid].get(cf):
+                fills.setdefault(cid, {})[cf] = new
+                acc[cid][cf] = new                   # WRITE BACK
+            elif acc[cid][cf] != new:
+                enrich_rows.append({"contact_id": cid, "field": cf, "old_value": acc[cid][cf],
+                                    "new_value": new, "source": it["source"],
+                                    "method": "import_conflict"})
+        if staged.get("full_name") and staged["full_name"] != acc[cid].get("full_name"):
+            enrich_rows.append({"contact_id": cid, "field": "full_name",
+                                "old_value": acc[cid].get("full_name"),
+                                "new_value": staged["full_name"], "source": it["source"],
+                                "method": "import_conflict"})
+        outcomes[it["id"]] = "attached"
+    return id_inserts, enrich_rows, fills, outcomes
+
+
 def _execute_cluster(client, items, state, lock):
     keymap = {}
     creates = [it for it in items if it.get("create_key")]
@@ -105,6 +145,34 @@ def _execute_cluster(client, items, state, lock):
     def deref(ref):
         return keymap.get(ref, ref)
 
+    # ---- auto_matched branch: batched reads → in-memory fold → batched writes ----
+    auto = [it for it in items if it["match_status"] == "auto_matched"]
+    cids = sorted({deref(it["matched_ref"]) for it in auto})
+    contact_by_id = {c["id"]: c for c in
+                     client.table("contacts").select("*").in_("id", cids).execute().data} \
+        if cids else {}
+    sxids = sorted({it["identity"]["source_external_id"] for it in auto
+                    if it["identity"].get("source_external_id")})
+    existing = {}                                  # (source, source_external_id) -> contact_id
+    for i in range(0, len(sxids), 100):
+        for r in (client.table("contact_identities")
+                  .select("source,source_external_id,contact_id")
+                  .in_("source_external_id", sxids[i:i + 100]).execute().data):
+            existing[(r["source"], r["source_external_id"])] = r["contact_id"]
+
+    id_inserts, enrich_rows, fills, outcomes = _fold_auto(
+        auto, deref, contact_by_id, existing)
+
+    if id_inserts:
+        # insert-or-ignore via RPC: PostgREST .upsert() can't target the PARTIAL
+        # unique index on (source, source_external_id), and ON CONFLICT DO NOTHING
+        # guarantees a duplicate/pre-existing identity never aborts the batch.
+        client.rpc("bulk_insert_identities", {"payload": id_inserts}).execute()
+    if enrich_rows:
+        client.table("enrichment_log").insert(enrich_rows).execute()
+    for cid, upd in fills.items():
+        client.table("contacts").update({**upd, "updated_at": "now()"}).eq("id", cid).execute()
+
     patches = []
     for it in items:
         st = it["match_status"]
@@ -116,8 +184,7 @@ def _execute_cluster(client, items, state, lock):
             _bump(state, lock, "created")
         elif st == "auto_matched":
             cid = deref(it["matched_ref"])
-            if _attach_identity(client, it["identity"], cid):
-                _fill_and_log(client, cid, it["staged"], it["source"])
+            if outcomes[it["id"]] == "attached":
                 patches.append(_patch(it, "auto_matched", cid,
                                       conf=it.get("match_confidence"), method=it["match_method"]))
                 _bump(state, lock, "auto")
@@ -138,8 +205,8 @@ def _execute_cluster(client, items, state, lock):
 def _attach(client, staged: dict, contact_id: str) -> bool:
     """Sequential single-row attach — used by `crm review --approve`. Idempotent
     select-first identity guard (rerun_conflict patches staging + returns False),
-    then fill-null + conflict-log. The bulk dedup path uses _attach_identity +
-    _fill_and_log instead; this preserves the manual-review callsite unchanged."""
+    then fill-null + conflict-log. The bulk dedup path uses the batched _fold_auto
+    fold instead; this preserves the manual-review callsite unchanged."""
     existing = []
     if staged.get("source_external_id"):
         existing = (client.table("contact_identities")
@@ -228,18 +295,28 @@ def dedup(workers: int = typer.Option(4, "--workers", help="Parallel workers (1-
         raise typer.Exit(1)
 
 
-def _candidate_display(client, q: dict) -> str:
+def _candidate_display(maps: dict, q: dict) -> str:
     """Return a human-readable candidate string for a review queue row.
 
+    Pure function over prefetched maps — no DB calls.
+
+    maps keys:
+      "contacts": {contact_id: {"full_name": ..., "current_company": ...}}
+      "identities": {field: {value: [contact_id, ...]}}
+        where field in ("email", "linkedin_url", "phone")
+
     For conflicting_keys / rerun_conflict: re-derive ALL distinct contact_ids
-    by querying contact_identities for every key the staged row has, then
+    from the prefetched identity maps for every key the staged row has, then
     render them as "Name (Co), Name2 (Co2)".
     For fuzzy_name: single lookup of matched_contact_id → "Name (Co or ?)".
     Handles missing/deleted contacts gracefully with "<gone>".
     """
+    contact_map: dict = maps["contacts"]
+    identity_map: dict = maps["identities"]
+
     conflict_methods = ("conflicting_keys", "rerun_conflict")
     if q.get("match_method") in conflict_methods:
-        # Re-derive all candidates from the staged row's identity keys
+        # Re-derive all candidates from the staged row's identity keys (in-memory)
         candidate_ids: set[str] = set()
         for field in ("email", "linkedin_url", "phone"):
             val = q.get(field)
@@ -247,12 +324,8 @@ def _candidate_display(client, q: dict) -> str:
                 continue
             if field == "email" and _is_role_email(val):
                 continue
-            rows = (client.table("contact_identities")
-                    .select("contact_id")
-                    .eq(field, val)
-                    .execute().data)
-            for r in rows:
-                candidate_ids.add(r["contact_id"])
+            for cid in identity_map.get(field, {}).get(val, []):
+                candidate_ids.add(cid)
         # Also include the stored matched_contact_id if present
         if q.get("matched_contact_id"):
             candidate_ids.add(q["matched_contact_id"])
@@ -260,13 +333,10 @@ def _candidate_display(client, q: dict) -> str:
             return "<no candidates>"
         parts = []
         for cid in candidate_ids:
-            contacts = (client.table("contacts")
-                        .select("full_name,current_company")
-                        .eq("id", cid).execute().data)
-            if not contacts:
+            if cid not in contact_map:
                 parts.append("<gone>")
             else:
-                c = contacts[0]
+                c = contact_map[cid]
                 co = c.get("current_company") or "?"
                 parts.append(f"{c['full_name']} ({co})")
         return ", ".join(parts)
@@ -275,14 +345,83 @@ def _candidate_display(client, q: dict) -> str:
         cid = q.get("matched_contact_id")
         if not cid:
             return "<none>"
-        contacts = (client.table("contacts")
-                    .select("full_name,current_company")
-                    .eq("id", cid).execute().data)
-        if not contacts:
+        if cid not in contact_map:
             return "<gone>"
-        c = contacts[0]
+        c = contact_map[cid]
         co = c.get("current_company") or "?"
         return f"{c['full_name']} ({co})"
+
+
+def _prefetch_display_maps(client, queue: list[dict]) -> dict:
+    """Pass 1: collect all ids/values needed by _candidate_display, issue batched reads.
+
+    Returns maps dict consumed by _candidate_display:
+      {
+        "contacts":   {contact_id: {full_name, current_company}},
+        "identities": {field: {value: [contact_id, ...]}},
+      }
+    """
+    conflict_methods = ("conflicting_keys", "rerun_conflict")
+
+    # Collect all contact_ids to fetch (from matched_contact_id on every row)
+    contact_ids: set[str] = set()
+    # Collect per-field values to look up in contact_identities
+    field_values: dict[str, set[str]] = {"email": set(), "linkedin_url": set(), "phone": set()}
+
+    for q in queue:
+        if q.get("matched_contact_id"):
+            contact_ids.add(q["matched_contact_id"])
+        if q.get("match_method") in conflict_methods:
+            for field in ("email", "linkedin_url", "phone"):
+                val = q.get(field)
+                if not val:
+                    continue
+                if field == "email" and _is_role_email(val):
+                    continue
+                field_values[field].add(val)
+
+    # Batched contacts fetch
+    contact_map: dict[str, dict] = {}
+    all_ids = sorted(contact_ids)
+    if all_ids:
+        rows = (client.table("contacts")
+                .select("id,full_name,current_company")
+                .in_("id", all_ids)
+                .execute().data)
+        for c in rows:
+            contact_map[c["id"]] = c
+
+    # Batched identity fetches (one query per field that has values)
+    identity_map: dict[str, dict[str, list[str]]] = {
+        "email": {}, "linkedin_url": {}, "phone": {}
+    }
+    for field, values in field_values.items():
+        if not values:
+            continue
+        rows = (client.table("contact_identities")
+                .select(f"contact_id,{field}")
+                .in_(field, sorted(values))
+                .execute().data)
+        for r in rows:
+            val = r[field]
+            cid = r["contact_id"]
+            identity_map[field].setdefault(val, []).append(cid)
+            # Also add these contact_ids to the contact fetch set if not already fetched
+            if cid not in contact_map:
+                contact_ids.add(cid)
+
+    # Second-pass contacts fetch for any contact_ids discovered via identity lookups
+    # (conflict rows may reference contacts not stored in matched_contact_id)
+    newly_discovered = [cid for cid in contact_ids if cid not in contact_map]
+    if newly_discovered:
+        rows = (client.table("contacts")
+                .select("id,full_name,current_company")
+                .in_("id", sorted(newly_discovered))
+                .execute().data)
+        for c in rows:
+            contact_map[c["id"]] = c
+
+    return {"contacts": contact_map, "identities": identity_map}
 
 
 def review(
@@ -345,8 +484,11 @@ def review(
         "match_confidence,match_method,matched_contact_id")
         .eq("match_status", "needs_review")
         .order("match_confidence", desc=True).execute().data)
+    # Pass 1: batched prefetch — one contacts select, ≤3 identity selects
+    maps = _prefetch_display_maps(client, queue)
+    # Pass 2: render from in-memory maps (no DB calls)
     for q in queue:
-        q["candidate"] = _candidate_display(client, q)
+        q["candidate"] = _candidate_display(maps, q)
     render(queue, as_json)
     if queue and not as_json:
         typer.echo("\nResolve: crm review --approve <id> | crm review --reject <id>")

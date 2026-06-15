@@ -10,3 +10,7 @@ dist/
 
 # agent workflow artifacts (handoffs, diagrams) — local only
 .claude/
+
+# Coverage artifacts
+.coverage
+coverage.xml

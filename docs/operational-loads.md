@@ -23,6 +23,31 @@ produces two CSVs and uses the generic commands.
 - **Substack** (Rahul downloads subscriber CSV): people CSV (email) + touchpoints
   (email, subscribed date, kind=origin, channel=email).
 
+## Cohort actions
+After import / dedup / backfill, agents can act on the resolved contacts:
+
+```
+# set a scalar field on a filtered cohort
+crm bulk set status=in_network --affiliation YC --dry-run --json
+crm bulk set status=in_network --affiliation YC --yes --json
+
+# add a registry tag (idempotent; reports cohort size vs newly-tagged count)
+crm bulk tag investors --affiliation YC --dry-run --json
+crm bulk tag investors --affiliation YC --yes --json
+
+# log the same touchpoint against a cohort
+crm bulk log --kind event --channel irl --summary "NeurIPS 2025" \
+    --tag ml-researchers --dry-run --json
+crm bulk log --kind event --channel irl --summary "NeurIPS 2025" \
+    --tag ml-researchers --yes --json
+```
+
+`--json` emits `{dry_run, cohort_count, affected, changed_count}` — use for
+agent-parseable output. Cohort filters are the same five as `crm list`
+(`--status`, `--tier`, `--tag`, `--affiliation`, `--cold-since`). A bare call
+with no filter is refused; pass `--all` to act on the entire table.
+`bulk set` handles scalar fields only — for tags use `bulk tag`.
+
 ## Order of native imports (matters)
 apple-contacts → dedup → linkedin → dedup → imessage → backfill
 (names first, then handles can match)
