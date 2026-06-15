@@ -17,6 +17,16 @@ IDENTIFIER = "identifier"
 # fields that are hard match keys, not golden attributes — routed to quarantine
 IDENTIFIER_FIELDS = {"email", "linkedin_url", "phone", "handle"}
 
+# agents naturally say "company"/"role"/"title"; the golden columns are prefixed.
+# Normalize to the real column names so the survivorship RPC can materialize them
+# (an unmapped "company" would hit a non-existent column and crash the RPC).
+FIELD_ALIASES = {
+    "company": "current_company",
+    "role": "current_role",
+    "title": "current_role",
+    "job_title": "current_role",
+}
+
 
 @dataclass
 class EnrichCandidate:
@@ -35,6 +45,7 @@ def _one(obj: dict) -> EnrichCandidate:
     field = obj.get("field")
     if not field:
         raise ValueError("Candidate missing required 'field'")
+    field = FIELD_ALIASES.get(field, field)
     conf = obj.get("confidence")
     if conf is not None:
         conf = float(conf)

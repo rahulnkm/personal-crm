@@ -60,3 +60,33 @@ def test_apply_low_confidence_goes_to_review(db):
     assert r.exit_code == 0, r.output
     assert "review" in r.output
     assert len(db.table("enrich_review").select("id").eq("contact_id", c["id"]).execute().data) == 1
+
+
+def test_parse_aliases_natural_field_names():
+    # agents naturally send "company"/"role"; alias to the real golden columns
+    assert parse_payload('{"field":"company","value":"Bevy","source":"x"}')[0].field == "current_company"
+    assert parse_payload('{"field":"role","value":"PM","source":"x"}')[0].field == "current_role"
+    assert parse_payload('{"field":"title","value":"CEO","source":"x"}')[0].field == "current_role"
+
+
+def test_apply_company_alias_writes_current_company(db):
+    # regression: real (non-dry-run) write of the "company" field used to crash the
+    # survivorship RPC with 22004 (null col_type for a non-existent "company" column).
+    db.table("agents").upsert({"id": "claude-web", "description": "test"}, on_conflict="id").execute()
+    c = db.table("contacts").insert({"full_name": "Bevy Person", "current_company": None}).execute().data[0]
+    r = runner.invoke(app, ["enrich", "apply", c["id"], "--agent", "claude-web", "--json"],
+                      input='[{"field":"company","value":"Bevy","confidence":0.7,"source":"agent:claude-web"}]')
+    assert r.exit_code == 0, r.output
+    assert db.table("contacts").select("current_company").eq("id", c["id"]).single().execute().data["current_company"] == "Bevy"
+
+
+def test_apply_unknown_field_fails_cleanly(db):
+    # a genuinely unknown field must fail with a clear message, not a raw 22004
+    db.table("agents").upsert({"id": "claude-web", "description": "test"}, on_conflict="id").execute()
+    c = db.table("contacts").insert({"full_name": "Zed"}).execute().data[0]
+    r = runner.invoke(app, ["enrich", "apply", c["id"], "--agent", "claude-web", "--json"],
+                      input='[{"field":"definitely_not_a_column","value":"x","confidence":0.9,"source":"x"}]')
+    surfaced = (r.output + str(r.exception or "")).lower()
+    assert r.exit_code != 0
+    assert "unknown contacts field" in surfaced  # clean message…
+    assert "22004" not in surfaced               # …not the cryptic identifier crash

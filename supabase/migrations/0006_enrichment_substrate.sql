@@ -115,6 +115,15 @@ begin
     return 'noop';  -- arrays handled by set-union path, not survivorship
   end if;
 
+  -- fail fast on a field that isn't a real scalar contacts column. Without this,
+  -- materialization later does format(..., %I, col_type) where col_type (looked up
+  -- from information_schema) is NULL → cryptic 22004. Checked before the dry-run
+  -- return so dry-run and real writes agree.
+  if not exists (select 1 from information_schema.columns
+      where table_schema='public' and table_name='contacts' and column_name = p_field) then
+    raise exception 'unknown contacts field: %', p_field using errcode = '22023';
+  end if;
+
   perform pg_advisory_xact_lock(hashtext(p_contact_id::text || ':' || p_field));
 
   -- rejected value can never win again
