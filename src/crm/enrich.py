@@ -17,6 +17,11 @@ IDENTIFIER = "identifier"
 # fields that are hard match keys, not golden attributes — routed to quarantine
 IDENTIFIER_FIELDS = {"email", "linkedin_url", "phone", "handle"}
 
+# array (set-union) attribute fields. These are still kind=ATTRIBUTE (not identifiers),
+# but they have no single survivorship winner — they accumulate via enrich_apply_array
+# instead of enrich_apply_candidate.
+ARRAY_FIELDS = {"tags", "affiliations", "expertise", "interests"}
+
 # agents naturally say "company"/"role"/"title"; the golden columns are prefixed.
 # Normalize to the real column names so the survivorship RPC can materialize them
 # (an unmapped "company" would hit a non-existent column and crash the RPC).
