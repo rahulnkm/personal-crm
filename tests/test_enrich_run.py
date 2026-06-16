@@ -181,3 +181,29 @@ def test_run_limit_caps_contacts(db, patch_sources):
     r = runner.invoke(app, ["enrich", "run", "--limit", "1", "--json"])
     assert r.exit_code == 0, r.output
     assert len(json.loads(r.output)["contacts"]) == 1
+
+
+def test_run_limit_caps_touched(db, patch_sources):
+    patch_sources(FakeSource("gravatar", [Candidate("location", "SF", 0.9, None)]))
+    for i in range(5):
+        _seed_contact(db, email=f"p{i}@e.com", full_name=f"P{i}")
+    r = runner.invoke(app, ["enrich", "run", "--limit", "2", "--no-only-missing", "--json"])
+    assert r.exit_code == 0, r.output
+    assert json.loads(r.output)["summary"]["contacts"] == 2
+
+
+def test_run_all_reaches_contact_on_file(db, patch_sources):
+    patch_sources(FakeSource("gravatar", [Candidate("location", "SF", 0.9, None)]))
+    c = _seed_contact(db, email="onfile@e.com", full_name="OnFile",
+                      connection_status="contact_on_file", closeness_tier="none")
+    r = runner.invoke(app, ["enrich", "run", "--all", "--no-only-missing", "--json"])
+    assert r.exit_code == 0, r.output
+    assert c["id"] in r.output
+
+
+def test_run_tallies_reviewed(db, patch_sources):
+    patch_sources(FakeSource("gravatar", [Candidate("current_role", "Wizard", 0.4, None)]))
+    _seed_contact(db, email="rev@e.com", full_name="RevPerson")
+    r = runner.invoke(app, ["enrich", "run", "--no-only-missing", "--json"])
+    assert r.exit_code == 0, r.output
+    assert json.loads(r.output)["summary"]["reviewed"] == 1

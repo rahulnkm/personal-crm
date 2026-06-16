@@ -88,8 +88,11 @@ def run(
                                 help="Comma list (default: all): gravatar,github"),
     status: str = typer.Option("in_network", "--status",
                                help="connection_status filter (default in_network)"),
+    all_contacts: bool = typer.Option(False, "--all",
+                                      help="Ignore the connection_status filter (whole DB)"),
     tier: str = typer.Option(None, "--tier", help="Comma list of closeness tiers"),
-    limit: int = typer.Option(None, "--limit", help="Cap contacts processed (batching)"),
+    due: bool = typer.Option(False, "--due", help="Only contacts with a stale (past-refresh) field"),
+    limit: int = typer.Option(None, "--limit", help="Cap contacts touched (batching)"),
     dry_run: bool = typer.Option(False, "--dry-run", help="Compute outcomes, write nothing"),
     only_missing: bool = typer.Option(
         True, "--only-missing/--no-only-missing",
@@ -114,24 +117,25 @@ def run(
         err(f"No known sources in {sources!r}; available: gravatar, github")
         raise typer.Exit(2)
 
-    contacts = _candidate_contacts(client, status, tier)
+    contacts = _candidate_contacts(client, None if all_contacts else status, tier)
+    if due:
+        due_ids = _due_contact_ids(client)
+        contacts = [c for c in contacts if c["id"] in due_ids]
     contacts.sort(key=lambda c: (
         _TIER_RANK.get(c.get("closeness_tier"), 99),
         0 if c.get("connection_status") == "in_network" else 1,
         c.get("full_name") or ""))
+    if limit is not None:
+        contacts = contacts[:limit]
 
     limiter = _RateLimiter()
     results: list[dict] = []
-    processed = 0
     today = date.today().isoformat()
     summary = {"contacts": 0, "enriched_contacts": 0, "enriched_fields": 0,
-               "skipped": 0, "no_email": 0, "no_signal": 0, "errors": 0,
+               "skipped": 0, "no_email": 0, "reviewed": 0, "no_signal": 0, "errors": 0,
                "dry_run": dry_run}
 
     for c in contacts:
-        if limit is not None and processed >= limit:
-            break
-
         email = _primary_email(client, c["id"])
         produced_fields = set().union(*[s.produces for s in selected])
         if only_missing and _already_satisfied(c, produced_fields):
@@ -145,10 +149,10 @@ def run(
             summary["no_email"] += 1
             continue
 
-        processed += 1
         summary["contacts"] += 1
         fields_written = 0
         errored = False
+        reviewed_any = False
         for src in selected:
             limiter.wait(src.name)
             try:
@@ -166,6 +170,8 @@ def run(
                 }).execute().data
                 if outcome == "golden":
                     fields_written += 1
+                elif outcome == "review":
+                    reviewed_any = True
 
         if not dry_run:
             client.table("contacts").update(
@@ -178,6 +184,9 @@ def run(
             status_label = "enriched"
             summary["enriched_contacts"] += 1
             summary["enriched_fields"] += fields_written
+        elif reviewed_any:
+            status_label = "reviewed"
+            summary["reviewed"] += 1
         else:
             status_label = "no_signal"
             summary["no_signal"] += 1
@@ -194,9 +203,50 @@ def run(
         typer.echo(
             f"— {summary['enriched_contacts']} enriched "
             f"({summary['enriched_fields']} fields), {summary['skipped']} skipped, "
-            f"{summary['no_email']} no-email, {summary['no_signal']} no-signal, "
-            f"{summary['errors']} errors"
+            f"{summary['no_email']} no-email, {summary['reviewed']} reviewed, "
+            f"{summary['no_signal']} no-signal, {summary['errors']} errors"
             + (" [dry-run]" if dry_run else ""))
+
+
+def _due_contact_ids(client) -> set[str]:
+    """Contact ids with any is_current field past its refresh_after (NULL excluded by .lt)."""
+    from datetime import date
+    today = date.today().isoformat()
+    ids: set[str] = set()
+    start = 0
+    while True:
+        page = (client.table("enrichment_log").select("contact_id")
+                .eq("is_current", True).lt("refresh_after", today)
+                .range(start, start + 999).execute().data)
+        ids.update(r["contact_id"] for r in page)
+        if len(page) < 1000:
+            break
+        start += 1000
+    return ids
+
+
+@enrich_app.command("due")
+def due(as_json: bool = typer.Option(False, "--json")):
+    """Contacts with a stale (past-refresh) field, closeness-ranked — feed to `run --due`."""
+    client = get_client()
+    ids = _due_contact_ids(client)
+    if not ids:
+        typer.echo("[]" if as_json else "nothing due")
+        return
+    rows: list[dict] = []
+    id_list = list(ids)
+    for i in range(0, len(id_list), 200):  # PostgREST in_() chunk
+        rows.extend(client.table("contacts")
+                    .select("id,full_name,closeness_tier,current_company")
+                    .in_("id", id_list[i:i + 200]).execute().data)
+    rows.sort(key=lambda c: (_TIER_RANK.get(c.get("closeness_tier"), 99), c.get("full_name") or ""))
+    if as_json:
+        typer.echo(json.dumps(rows, default=str))
+    else:
+        for c in rows:
+            typer.echo(f"{c['full_name']} — {c.get('current_company') or '?'} "
+                       f"[{c.get('closeness_tier')}]")
+        typer.echo(f"— {len(rows)} due")
 
 
 def _candidate_contacts(client, status: str | None, tier: str | None) -> list[dict]:
