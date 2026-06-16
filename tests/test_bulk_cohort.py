@@ -170,11 +170,12 @@ def test_list_contacts_status_filter_characterization(db):
     assert "Char Alice" in names
     assert "Char Bob" not in names
 
-    # verify the 9 expected columns are present in each row
+    # list now also surfaces company_category + location (enrichment retrieval needs
+    # them; extra keys are backward-compatible for consumers).
     expected_cols = {
         "id", "full_name", "current_role", "current_company",
         "connection_status", "closeness_tier", "affiliations",
-        "tags", "last_touchpoint_at",
+        "tags", "last_touchpoint_at", "company_category", "location",
     }
     for row in rows:
         assert expected_cols == set(row.keys()), (

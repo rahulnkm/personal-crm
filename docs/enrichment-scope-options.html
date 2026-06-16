@@ -1,0 +1,48 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Where enrichment lives — 3 options</title>
+</head>
+<body>
+<pre class="mermaid" style="display:none">
+flowchart TB
+  contacts(["Your contacts:<br/>name, email, sparse fields"]):::client
+
+  subgraph A["OPTION A — Built-in subsystem"]
+    direction TB
+    a_cli["crm enrich (CLI):<br/>waterfall + sources + LLM"]:::action
+    a_core["write-path:<br/>provenance, survivorship, review"]:::action
+    a_db[("contacts +<br/>enrichment_log")]:::store
+    a_cli --> a_core --> a_db
+  end
+
+  subgraph B["OPTION B — Substrate + thin enrichers (recommended)"]
+    direction TB
+    b_cli["crm enrich: deterministic sources<br/>(Gravatar / GitHub) + apply-ingest"]:::action
+    b_core["write-path:<br/>provenance, survivorship, review"]:::action
+    b_db[("contacts +<br/>enrichment_log")]:::store
+    b_agent[["consuming agent:<br/>Claude LLM + web_search"]]:::ext
+    b_cli --> b_core --> b_db
+    b_agent -. writes back via CLI .-> b_cli
+  end
+
+  subgraph C["OPTION C — Pure substrate"]
+    direction TB
+    c_cli["crm: write primitives +<br/>freshness queries only"]:::action
+    c_db[("contacts +<br/>enrichment_log")]:::store
+    c_agent[["consuming agents do ALL enrichment<br/>(even Gravatar / GitHub)"]]:::ext
+    c_cli --> c_db
+    c_agent -. writes back via CLI .-> c_cli
+  end
+
+  contacts --> A
+  contacts --> B
+  contacts --> C
+</pre>
+<script type="module">
+  import('https://cdn.jsdelivr.net/gh/rahulnkm/diagram-runtime@main/diagram.js?t=' + Date.now());
+</script>
+</body>
+</html>

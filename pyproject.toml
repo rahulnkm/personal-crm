@@ -16,6 +16,7 @@ dev = [
     "httpx>=0.28.1",
     "pytest>=8.0",
     "pytest-cov>=6.1",
+    "respx>=0.23.1",
 ]
 
 [project.scripts]

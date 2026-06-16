@@ -9,12 +9,14 @@ from crm.commands.contacts import add, contact, list_contacts, note, search, set
 from crm.commands.backfill import backfill
 from crm.commands.bulk import bulk_app
 from crm.commands.dedup import dedup, merge, review, split
+from crm.commands.enrich import enrich_app
 from crm.commands.import_csv import import_app
 import crm.commands.import_touchpoints  # noqa: F401  (registers import subcommand)
 import crm.commands.import_linkedin  # noqa: F401  (registers import subcommand)
 import crm.commands.import_apple  # noqa: F401  (registers import subcommand)
 import crm.commands.import_imessage  # noqa: F401  (registers import subcommand)
 from crm.commands.log import event_app, log
+from crm.commands.retrieval import capsules, find
 from crm.output import err
 
 app = typer.Typer(help="Personal CRM — Rahul's real-network base. Pure data layer.")
@@ -22,6 +24,7 @@ app = typer.Typer(help="Personal CRM — Rahul's real-network base. Pure data la
 app.add_typer(agent_app, name="agent")
 app.add_typer(tags_app, name="tags")
 app.add_typer(import_app, name="import")
+app.add_typer(enrich_app, name="enrich")
 app.add_typer(bulk_app, name="bulk")
 app.command("stats")(stats)
 app.command("sync-status")(sync_status)
@@ -32,6 +35,8 @@ app.command("split")(split)
 app.command("contact")(contact)
 app.command("list")(list_contacts)
 app.command("search")(search)
+app.command("capsules")(capsules)
+app.command("find")(find)
 app.command("add")(add)
 app.command("set")(set_field)
 app.command("note")(note)

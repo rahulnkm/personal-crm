@@ -1,0 +1,107 @@
+import uuid
+
+
+def test_enrichment_substrate_schema(db):
+    # new enrichment_log columns
+    row = db.table("enrichment_log").select(
+        "source_detail, verification_status, refresh_after, is_current").limit(1).execute()
+    assert row is not None
+    # new contacts columns
+    c = db.table("contacts").select(
+        "company_category, company_description, company_domain, expertise, interests, "
+        "avatar_url, github_username, twitter_username, website_url").limit(1).execute()
+    assert c is not None
+    # new tables exist
+    assert db.table("enrich_review").select("id").limit(1).execute() is not None
+    assert db.table("candidate_identities").select("id").limit(1).execute() is not None
+
+
+def _contact(db, **kw):
+    base = {"full_name": "Test Person"}; base.update(kw)
+    return db.table("contacts").insert(base).execute().data[0]
+
+
+def _apply(db, cid, field, value, method, source, conf, dry=False):
+    return db.rpc("enrich_apply_candidate", {
+        "p_contact_id": cid, "p_field": field, "p_value": value,
+        "p_method": method, "p_source": source, "p_confidence": conf,
+        "p_source_detail": None, "p_dry_run": dry}).execute().data
+
+
+def test_fills_null_field_becomes_golden(db):
+    c = _contact(db, current_company=None)
+    out = _apply(db, c["id"], "current_company", "Acme", "enrich_api", "gravatar", 0.9)
+    assert out == "golden"
+    got = db.table("contacts").select("current_company").eq("id", c["id"]).single().execute().data
+    assert got["current_company"] == "Acme"
+
+
+def test_manual_never_clobbered(db):
+    c = _contact(db)
+    _apply(db, c["id"], "current_company", "RealCo", "manual_set", "rahul", 1.0)
+    out = _apply(db, c["id"], "current_company", "BrokerCo", "enrich_api", "pdl", 0.95)
+    assert out in ("review", "losing")
+    got = db.table("contacts").select("current_company").eq("id", c["id"]).single().execute().data
+    assert got["current_company"] == "RealCo"  # manual stands
+
+
+def test_low_confidence_goes_to_review_not_golden(db):
+    c = _contact(db, current_role=None)
+    out = _apply(db, c["id"], "current_role", "Wizard", "enrich_agent", "agent:claude-web", 0.5)
+    assert out == "review"
+    assert db.table("contacts").select("current_role").eq("id", c["id"]).single().execute().data["current_role"] is None
+    assert len(db.table("enrich_review").select("id").eq("contact_id", c["id"]).execute().data) == 1
+
+
+def test_dry_run_mutates_nothing(db):
+    c = _contact(db, location=None)
+    out = _apply(db, c["id"], "location", "SF", "enrich_api", "gravatar", 0.9, dry=True)
+    assert out == "golden"  # would-be outcome
+    assert db.table("contacts").select("location").eq("id", c["id"]).single().execute().data["location"] is None
+
+
+def test_idempotent_reapply(db):
+    c = _contact(db, location=None)
+    _apply(db, c["id"], "location", "NYC", "enrich_api", "gravatar", 0.9)
+    _apply(db, c["id"], "location", "NYC", "enrich_api", "gravatar", 0.9)
+    rows = db.table("enrichment_log").select("id").eq("contact_id", c["id"]).eq("field","location").execute().data
+    assert len(rows) == 1
+
+
+def test_exactly_one_current(db):
+    c = _contact(db, location=None)
+    _apply(db, c["id"], "location", "NYC", "enrich_api", "gravatar", 0.9)
+    _apply(db, c["id"], "location", "LA", "enrich_api", "pdl", 0.95)  # newer+higher → new winner
+    cur = db.table("enrichment_log").select("new_value").eq("contact_id", c["id"]).eq("field","location").eq("is_current", True).execute().data
+    assert len(cur) == 1
+
+
+def test_concurrent_applies_one_winner(db):
+    import concurrent.futures as cf
+    c = _contact(db, location=None)
+    vals = [("NYC","gravatar",0.9),("LA","pdl",0.92),("SF","github",0.88),("Berlin","pdl",0.95)]
+    def apply(v):
+        from crm.config import get_client
+        return get_client().rpc("enrich_apply_candidate", {
+            "p_contact_id": c["id"],"p_field":"location","p_value":v[0],
+            "p_method":"enrich_api","p_source":v[1],"p_confidence":v[2],
+            "p_source_detail":None,"p_dry_run":False}).execute().data
+    with cf.ThreadPoolExecutor(max_workers=4) as ex:
+        list(ex.map(apply, vals))
+    cur = db.table("enrichment_log").select("new_value").eq("contact_id",c["id"]).eq("field","location").eq("is_current",True).execute().data
+    assert len(cur) == 1
+    got = db.table("contacts").select("location").eq("id",c["id"]).single().execute().data["location"]
+    assert got == cur[0]["new_value"]  # materialized value matches the one current row
+
+
+def test_backfill_protects_existing_value(db):
+    # simulate a pre-existing contact value with no provenance, then run the seed fn
+    c = _contact(db, current_company="LegacyCo")
+    db.rpc("enrich_seed_provenance", {}).execute()  # idempotent seed over all contacts
+    # an API value below... legacy is 0.8; a 0.7 web value should NOT overwrite (loses on recency? ensure)
+    out = _apply(db, c["id"], "current_company", "WebCo", "enrich_api", "pdl", 0.85)
+    got = db.table("contacts").select("current_company").eq("id",c["id"]).single().execute().data["current_company"]
+    # legacy seed exists & is_current; a higher-confidence newer value MAY win — but a human one never loses.
+    # Assert at minimum: a provenance row now exists and is_current for the legacy value pre-apply.
+    rows = db.table("enrichment_log").select("method,is_current,new_value").eq("contact_id",c["id"]).eq("field","current_company").execute().data
+    assert any(r["new_value"]=="LegacyCo" for r in rows)

@@ -1,0 +1,54 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Plan 2 — Grounded Enrichment Pipeline</title>
+</head>
+<body>
+<pre class="mermaid" style="display:none">
+flowchart TD
+  mode{{"entry: bulk fill-all  ·OR·  JIT on query-surfaced"}}:::gateway --> contact(["Contact + gaps"]):::client
+  contact --> bundle["Evidence bundle<br/>(dated, cited)"]:::action
+
+  subgraph SRC["Evidence sources"]
+    direction LR
+    im[[iMessage chat.db]]:::ext
+    tg[[Telegram]]:::ext
+    gm[[Gmail]]:::ext
+    cal[[Calendar]]:::ext
+    web[[Web — recency]]:::ext
+    prof[(profile / imports)]:::store
+  end
+  SRC --> bundle
+
+  bundle --> synth["Synthesize record<br/>origin_context · expertise[] · notes · current<br/>(Claude / subagents)"]:::action
+  synth --> gate{"enrichment-critique gate<br/>G1 grounded · G2 gender · G3 fresh<br/>G4 no-fluff · G5 expertise"}:::decision
+  gate -->|"REVISE / fetch recent"| synth
+  gate -->|"PASS"| apply["crm enrich apply"]:::action
+
+  apply --> route{"field kind?"}:::decision
+  route -->|"scalar attr"| rpc1["enrich_apply_candidate<br/>survivorship · manual-wins"]:::action
+  route -->|"array attr"| rpc2["enrich_apply_array<br/>set-union · DONE"]:::action
+  route -->|"identifier"| cand[(candidate_identities<br/>quarantine)]:::store
+
+  rpc1 --> gold[(contacts — golden)]:::store
+  rpc2 --> gold
+  rpc1 --> prov[(enrichment_log<br/>provenance)]:::store
+  rpc2 --> prov
+  rpc1 -.->|"low-confidence / conflict"| rev[(enrich_review)]:::store
+
+  gold --> done((("searchable network<br/>crm find / list / capsules"))):::done
+
+  subgraph TODO["Plan 2 — remaining build"]
+    direction LR
+    t1["durable research-agent skill"]:::danger
+    t2["crm enrich run: --limit + tier-priority"]:::danger
+    t3["freshness clock: refresh_after + crm enrich due"]:::danger
+  end
+</pre>
+<script type="module">
+  import('https://cdn.jsdelivr.net/gh/rahulnkm/diagram-runtime@main/diagram.js?t=' + Date.now());
+</script>
+</body>
+</html>

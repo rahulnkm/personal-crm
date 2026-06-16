@@ -15,11 +15,23 @@ import httpx
 import pytest
 from dotenv import dotenv_values
 
-LOCAL_URL = "http://127.0.0.1:54321"
 LOCAL_ENV = Path(__file__).resolve().parent.parent / ".env.local"
+
+
+def _local_url() -> str:
+    """Local stack URL from .env.local (so an isolated stack on a non-default
+    port works), falling back to the default. Loopback-only — never a remote DB."""
+    url = dotenv_values(LOCAL_ENV).get("SUPABASE_URL") if LOCAL_ENV.exists() else None
+    if url and ("127.0.0.1" in url or "localhost" in url):
+        return url
+    return "http://127.0.0.1:54321"
+
+
+LOCAL_URL = _local_url()
 
 DATA_TABLES = [
     "staging_interactions",
+    "enrich_review", "candidate_identities",
     "enrichment_log", "interactions", "events", "staging",
     "contact_identities", "contacts", "tag_registry",
 ]
