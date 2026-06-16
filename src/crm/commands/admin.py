@@ -72,28 +72,26 @@ def tags_list(as_json: bool = typer.Option(False, "--json")):
 
 
 def stats(as_json: bool = typer.Option(False, "--json")):
-    """Coverage: contacts by status/tier, staging by match_status. Uses head-count
-    queries so counts stay exact past PostgREST's 1,000-row response cap."""
+    """Coverage: contacts by status/tier, staging by match_status. Single
+    crm_stats() RPC replaces the previous 16 head-count round-trips."""
     client = get_client()
-
-    def count(table: str, col: str, val: str) -> int:
-        r = client.table(table).select("id", count="exact", head=True).eq(col, val).execute()
-        return r.count or 0
-
+    raw = client.rpc("crm_stats", {}).execute().data or {}
+    # PostgREST may unwrap a single-row set-returning function into a list
+    data: dict = raw if isinstance(raw, dict) else (raw[0] if raw else {})
     out = []
     for status in ("in_network", "contact_on_file"):
         out.append({"metric": f"connection_status={status}",
-                    "count": count("contacts", "connection_status", status)})
+                    "count": (data.get("connection_status") or {}).get(status, 0)})
     for tier in ("t1_irl_messaging", "t2_dm", "t3_community", "t4_public", "none"):
         out.append({"metric": f"closeness_tier={tier}",
-                    "count": count("contacts", "closeness_tier", tier)})
+                    "count": (data.get("closeness_tier") or {}).get(tier, 0)})
     for ms in ("pending", "auto_matched", "needs_review", "merged", "rejected"):
-        out.append({"metric": f"staging={ms}", "count": count("staging", "match_status", ms)})
+        out.append({"metric": f"staging={ms}",
+                    "count": (data.get("staging") or {}).get(ms, 0)})
     for ms in ("pending", "linked", "orphaned"):
         out.append({"metric": f"touchpoints={ms}",
-                    "count": count("staging_interactions", "match_status", ms)})
-    total = client.table("contacts").select("id", count="exact", head=True).execute()
-    out.append({"metric": "contacts_total", "count": total.count or 0})
+                    "count": (data.get("touchpoints") or {}).get(ms, 0)})
+    out.append({"metric": "contacts_total", "count": data.get("contacts_total", 0)})
     out = [o for o in out if o["count"] or o["metric"] == "contacts_total"]
     render(out, as_json)
 

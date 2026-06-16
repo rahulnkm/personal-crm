@@ -46,8 +46,25 @@ crm sync-status                       # re-run after backfill; --dry-run to prev
 # Review & query
 crm review       # arbitrate ambiguous matches (--approve/--reject/--to)
 crm list --status in_network --cold-since 6   # who to reconnect with
+crm list --role founder --status in_network   # surface by role (substring on current_role)
 crm contact "<name>"                          # full context for drafting
 crm log / crm event add                       # record touchpoints manually
+
+# Bulk writes — always dry-run first, then --yes to apply
+crm bulk set status=in_network --affiliation YC --dry-run
+crm bulk set status=in_network --affiliation YC --yes
+
+crm bulk tag investors --affiliation YC --dry-run
+crm bulk tag investors --affiliation YC --yes
+
+crm bulk log --kind event --channel irl --summary "NeurIPS 2025" \
+    --tag ml-researchers --dry-run
+crm bulk log --kind event --channel irl --summary "NeurIPS 2025" \
+    --tag ml-researchers --yes
+
+# Cohort filters (same as crm list): --status --tier --tag --affiliation --cold-since
+# Safety: a write always needs --yes; pass --all only to act on the entire table.
+# Machine output: --json emits {dry_run, cohort_count, affected, changed_count}
 ```
 
 Agent-run extractions (Gmail, Telegram, Luma, Substack) need no bespoke code —

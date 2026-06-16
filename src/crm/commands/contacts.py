@@ -12,7 +12,7 @@ from crm.output import err, render
 SETTABLE = {
     "connection_status", "closeness_tier", "current_role", "current_company",
     "location", "origin_context", "email_status", "full_name",
-    "affiliations", "tags", "expertise", "interests",
+    "affiliations", "tags", "expertise", "interests", "last_enriched_at",
 }
 ARRAY_FIELDS = {"affiliations", "tags", "expertise", "interests"}
 

@@ -12,8 +12,10 @@ dependencies = [
 
 [dependency-groups]
 dev = [
+    "diff-cover>=9.2",
     "httpx>=0.28.1",
     "pytest>=8.0",
+    "pytest-cov>=6.1",
     "respx>=0.23.1",
 ]
 
@@ -29,3 +31,8 @@ packages = ["src/crm"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+
+[tool.coverage.run]
+source = ["crm"]
+branch = true
+omit = ["tests/*", "scripts/*"]

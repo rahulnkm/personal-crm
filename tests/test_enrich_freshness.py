@@ -11,13 +11,22 @@ def _d(days):
     return (datetime.date.today() + datetime.timedelta(days=days)).isoformat()
 
 
+def _near(actual, days):
+    # SQL current_date (UTC) vs Python today (local) can differ by a day at the
+    # date boundary; a ±1d window is exact enough for a 90/180-day TTL.
+    assert actual is not None, "expected a date, got NULL"
+    got = datetime.date.fromisoformat(actual)
+    want = datetime.date.today() + datetime.timedelta(days=days)
+    assert abs((got - want).days) <= 1, f"{actual} not ~{days}d out"
+
+
 def test_refresh_after_ttls(db):
     f = lambda field, method: db.rpc(
         "enrich_refresh_after", {"p_field": field, "p_method": method}).execute().data
-    assert f("current_company", "enrich_api") == _d(90)
-    assert f("current_role", "enrich_api") == _d(90)
-    assert f("company_category", "enrich_api") == _d(90)
-    assert f("location", "enrich_api") == _d(180)
+    _near(f("current_company", "enrich_api"), 90)
+    _near(f("current_role", "enrich_api"), 90)
+    _near(f("company_category", "enrich_api"), 90)
+    _near(f("location", "enrich_api"), 180)
     assert f("origin_context", "enrich_api") is None      # stable → never
     assert f("expertise", "enrich_api") is None
     assert f("current_company", "manual_set") is None     # manual → never
@@ -31,7 +40,7 @@ def test_apply_stamps_refresh_after(db):
         "p_source_detail": None, "p_dry_run": False}).execute()
     vol = db.table("enrichment_log").select("refresh_after").eq("contact_id", c["id"]) \
         .eq("field", "current_company").eq("is_current", True).single().execute().data
-    assert vol["refresh_after"] == _d(90)
+    _near(vol["refresh_after"], 90)
     db.rpc("enrich_apply_candidate", {
         "p_contact_id": c["id"], "p_field": "origin_context", "p_value": "met at X",
         "p_method": "enrich_api", "p_source": "x", "p_confidence": 0.9,

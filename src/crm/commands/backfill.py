@@ -93,16 +93,6 @@ def _process_page(client, rows: list[dict], agent: str) -> tuple[set, int, int]:
                     client, r["event_name"], r.get("occurred_at"),
                     r.get("event_location"), agent)
 
-    # bulk idempotency check (select-first: the unique index is partial,
-    # PostgREST upserts cannot target it)
-    ext_ids = sorted({r["source_external_id"] for r in rows})
-    existing: dict = {}
-    for i in range(0, len(ext_ids), PAGE):
-        for it in (client.table("interactions")
-                   .select("id,source,source_external_id")
-                   .in_("source_external_id", ext_ids[i:i + PAGE]).execute().data):
-            existing[(it["source"], it["source_external_id"])] = it["id"]
-
     inserts, patches, touched = [], [], set()
     linked = orphaned = 0
     for r in rows:
@@ -117,19 +107,17 @@ def _process_page(client, rows: list[dict], agent: str) -> tuple[set, int, int]:
             continue
         event_id = (event_ids.get((r["event_name"], r.get("occurred_at")))
                     if r.get("event_name") else None)
-        hit = existing.get((r["source"], r["source_external_id"]))
-        if hit:   # refresh contract: update in place, never duplicate
-            client.table("interactions").update(
-                {"occurred_at": r.get("occurred_at"), "summary": r.get("summary"),
-                 "event_id": event_id, "contact_id": contact_id,
-                 "updated_at": "now()"}).eq("id", hit).execute()
-        else:
-            inserts.append({"contact_id": contact_id, "event_id": event_id,
-                            "kind": r["kind"], "channel": r.get("channel"),
-                            "occurred_at": r.get("occurred_at"),
-                            "summary": r.get("summary"), "logged_by": agent,
-                            "source": r["source"],
-                            "source_external_id": r["source_external_id"]})
+        assert r.get("source_external_id") is not None, (
+            f"linked row missing source_external_id: {r!r}"
+        )
+        # Both new and previously-existing rows go into inserts; the RPC's
+        # ON CONFLICT (source, source_external_id) handles insert-or-refresh.
+        inserts.append({"contact_id": contact_id, "event_id": event_id,
+                        "kind": r["kind"], "channel": r.get("channel"),
+                        "occurred_at": r.get("occurred_at"),
+                        "summary": r.get("summary"), "logged_by": agent,
+                        "source": r["source"],
+                        "source_external_id": r["source_external_id"]})
         touched.add(contact_id)
         patch.update({"match_status": "linked", "matched_contact_id": contact_id,
                       "resolved_at": "now()"})
@@ -137,7 +125,11 @@ def _process_page(client, rows: list[dict], agent: str) -> tuple[set, int, int]:
         patches.append(patch)
 
     if inserts:
-        client.table("interactions").insert(inserts).execute()
+        moved = client.rpc("bulk_upsert_interactions", {"payload": inserts}).execute().data
+        # RPC returns setof uuid (prior contact_ids of re-pointed rows) as plain
+        # strings; union into touched so _recompute heals abandoned contacts.
+        for r in (moved or []):
+            touched.add(r["bulk_upsert_interactions"] if isinstance(r, dict) else r)
     if patches:
         client.table("staging_interactions").upsert(
             patches, on_conflict="source,source_external_id").execute()
