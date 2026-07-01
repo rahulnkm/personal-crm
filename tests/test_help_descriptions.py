@@ -14,7 +14,7 @@ from crm.cli import app
 BANNED = [
     "reconnection query",
     "write-isolation",
-    "16 round-trips",
+    "head-count round-trips",
     "additive and idempotent",
 ]
 
@@ -50,7 +50,9 @@ def test_every_command_has_a_description(path, cmd):
 
 @pytest.mark.parametrize("path,cmd", ALL, ids=[".".join(p) for p, _ in ALL])
 def test_no_banned_phrases(path, cmd):
-    text = _help_text(cmd).lower()
+    # normalize whitespace so multi-line docstrings can't hide a banned phrase
+    # across a newline (click preserves the "\n" between docstring lines)
+    text = " ".join(_help_text(cmd).lower().split())
     hit = [b for b in BANNED if b.lower() in text]
     assert not hit, f"{'.'.join(path)} still contains banned phrasing: {hit}"
 
@@ -62,7 +64,8 @@ def test_agent_and_json_help_are_reused_strings():
     for path, cmd in LEAF:
         for param in cmd.params:
             opts = getattr(param, "opts", [])
-            if "--agent" in opts and param.help is not None:
-                assert param.help == AGENT_HELP, f"{'.'.join(path)} --agent help drifted"
-            if "--json" in opts and param.help is not None:
-                assert param.help == JSON_HELP, f"{'.'.join(path)} --json help drifted"
+            # assert presence too (help is None == the pre-sweep blank bug), not just drift
+            if "--agent" in opts:
+                assert param.help == AGENT_HELP, f"{'.'.join(path)} --agent help missing/drifted"
+            if "--json" in opts:
+                assert param.help == JSON_HELP, f"{'.'.join(path)} --json help missing/drifted"
