@@ -14,7 +14,7 @@ from crm.commands.admin import require_agent
 from crm.config import get_client
 from crm.dedup_plan import IDENTITY_FIELDS, build_plan
 from crm.matching import _is_role_email, classify, find_candidates
-from crm.output import err, render
+from crm.output import AGENT_HELP, JSON_HELP, err, render
 
 FILL_FIELDS = {"current_role": "role", "current_company": "company",
                "location": "location"}
@@ -246,10 +246,8 @@ def _create(client, staged: dict) -> str:
 
 
 def dedup(workers: int = typer.Option(4, "--workers", help="Parallel workers (1-16)"),
-          agent: str = typer.Option("rahul", "--agent")):
-    """Two-phase dedup: serial plan, parallel execute. A cluster is a write-isolation
-    unit; verdicts replay the sequential engine. Crash-resume is identity-keyed
-    (rerun re-plans pending rows; atomic-create + select-first prevent dupes)."""
+          agent: str = typer.Option("rahul", "--agent", help=AGENT_HELP)):
+    """Resolve pending staging rows into golden contacts: auto-attach matches, create new, queue ambiguous for crm review. Resumable."""
     workers = max(1, min(MAX_WORKERS, workers))
     client = get_client()
     require_agent(client, agent)
@@ -428,8 +426,8 @@ def review(
     approve: str = typer.Option(None, "--approve", help="staging id: confirm the match"),
     reject: str = typer.Option(None, "--reject", help="staging id: not the same person"),
     to: str = typer.Option(None, "--to", help="contact id to attach to (overrides stored candidate)"),
-    as_json: bool = typer.Option(False, "--json"),
-    agent: str = typer.Option("rahul", "--agent"),
+    as_json: bool = typer.Option(False, "--json", help=JSON_HELP),
+    agent: str = typer.Option("rahul", "--agent", help=AGENT_HELP),
 ):
     """List the clerical-review queue, or resolve one row."""
     client = get_client()
@@ -497,7 +495,7 @@ def review(
 def merge(
     keep_id: str = typer.Argument(..., help="Contact to keep"),
     drop_id: str = typer.Argument(..., help="Contact to fold into the kept one"),
-    agent: str = typer.Option("rahul", "--agent"),
+    agent: str = typer.Option("rahul", "--agent", help=AGENT_HELP),
 ):
     """Manually fuse two contacts the matcher kept apart (under-merge fix)."""
     client = get_client()
@@ -544,9 +542,9 @@ def merge(
 
 
 def split(
-    contact_id: str = typer.Argument(...),
+    contact_id: str = typer.Argument(..., help="Contact the identity is wrongly merged into"),
     identity_id: str = typer.Argument(..., help="Identity to detach into a new contact"),
-    agent: str = typer.Option("rahul", "--agent"),
+    agent: str = typer.Option("rahul", "--agent", help=AGENT_HELP),
 ):
     """Detach a wrongly-merged identity into its own contact (over-merge fix)."""
     client = get_client()

@@ -7,7 +7,7 @@ import typer
 
 from crm.commands.admin import require_agent
 from crm.config import get_client
-from crm.output import err, render
+from crm.output import AGENT_HELP, JSON_HELP, err, render
 
 SETTABLE = {
     "connection_status", "closeness_tier", "current_role", "current_company",
@@ -21,6 +21,10 @@ ENUM_VALUES = {
     "closeness_tier": {"t1_irl_messaging", "t2_dm", "t3_community", "t4_public", "none"},
     "email_status": {"verified", "risky", "invalid", "unknown"},
 }
+
+# Reusable --status / --tier help listing valid enum values (used on add/set/list).
+STATUS_HELP = "connection_status: in_network | contact_on_file"
+TIER_HELP = "closeness_tier: t1_irl_messaging | t2_dm | t3_community | t4_public | none"
 
 # Role-token synonym expansion for --role / --role-class. Each token the caller
 # passes is matched as a case-insensitive substring; synonyms widen the net so
@@ -76,7 +80,7 @@ def _resolve(client, ref: str) -> dict:
 
 
 def contact(ref: str = typer.Argument(..., help="Contact name or uuid"),
-            as_json: bool = typer.Option(False, "--json")):
+            as_json: bool = typer.Option(False, "--json", help=JSON_HELP)):
     """Full record: golden + identities + interactions + enrichment history."""
     client = get_client()
     c = _resolve(client, ref)
@@ -201,8 +205,8 @@ def apply_contact_filters(
 
 
 def list_contacts(
-    status: str = typer.Option(None, "--status"),
-    tier: str = typer.Option(None, "--tier"),
+    status: str = typer.Option(None, "--status", help=STATUS_HELP),
+    tier: str = typer.Option(None, "--tier", help=TIER_HELP),
     tag: str = typer.Option(None, "--tag"),
     affiliation: str = typer.Option(None, "--affiliation"),
     role: str = typer.Option(None, "--role",
@@ -216,9 +220,9 @@ def list_contacts(
     cold_since: int = typer.Option(None, "--cold-since",
                                    help="Months since last touchpoint (or never)"),
     limit: int = typer.Option(100, "--limit"),
-    as_json: bool = typer.Option(False, "--json"),
+    as_json: bool = typer.Option(False, "--json", help=JSON_HELP),
 ):
-    """The reconnection query. Filters compose with AND."""
+    """List contacts by structured filters (AND-combined), oldest-touchpoint-first so overdue reconnections surface first."""
     limit = min(limit, 1000)  # PostgREST response cap
     client = get_client()
     q = client.table("contacts").select(
@@ -233,7 +237,7 @@ def list_contacts(
 
 
 def search(query: str = typer.Argument(...),
-           as_json: bool = typer.Option(False, "--json")):
+           as_json: bool = typer.Option(False, "--json", help=JSON_HELP)):
     """Fuzzy name search + substring match on company/notes."""
     client = get_client()
     # RPC uses a bound parameter — injection-safe, raw query is fine (accents/commas OK there)
@@ -260,14 +264,14 @@ def search(query: str = typer.Argument(...),
 
 def add(
     full_name: str = typer.Argument(...),
-    status: str = typer.Option("contact_on_file", "--status"),
-    tier: str = typer.Option("none", "--tier"),
+    status: str = typer.Option("contact_on_file", "--status", help=STATUS_HELP),
+    tier: str = typer.Option("none", "--tier", help=TIER_HELP),
     affiliation: list[str] = typer.Option([], "--affiliation"),
     role: str = typer.Option(None, "--role"),
     company: str = typer.Option(None, "--company"),
     email: str = typer.Option(None, "--email"),
     origin: str = typer.Option(None, "--origin", help="How/where connected"),
-    agent: str = typer.Option("rahul", "--agent"),
+    agent: str = typer.Option("rahul", "--agent", help=AGENT_HELP),
 ):
     """Directly add a person (e.g. a campaign agent adding a scraped contact)."""
     client = get_client()
@@ -302,10 +306,11 @@ def add(
 
 def set_field(
     ref: str = typer.Argument(...),
-    assignment: str = typer.Argument(..., help="field=value; array fields append"),
-    agent: str = typer.Option("rahul", "--agent"),
+    assignment: str = typer.Argument(
+        ..., help="field=value; scalars overwrite (blank clears), arrays append"),
+    agent: str = typer.Option("rahul", "--agent", help=AGENT_HELP),
 ):
-    """crm set <contact> connection_status=in_network — the toggle, agent-writable."""
+    """Set a contact field: crm set <ref> <field>=<value>. Scalars overwrite (blank clears); arrays append. Bad field prints the settable list."""
     client = get_client()
     require_agent(client, agent)
     if "=" not in assignment:
@@ -348,9 +353,9 @@ def set_field(
 
 
 def note(
-    ref: str = typer.Argument(...),
-    text: str = typer.Argument(...),
-    agent: str = typer.Option("rahul", "--agent"),
+    ref: str = typer.Argument(..., help="Contact name or uuid"),
+    text: str = typer.Argument(..., help="Note text (dated + agent-stamped on append)"),
+    agent: str = typer.Option("rahul", "--agent", help=AGENT_HELP),
 ):
     """Append a dated note to the contact's freeform notes."""
     client = get_client()

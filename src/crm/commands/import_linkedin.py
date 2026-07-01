@@ -19,7 +19,7 @@ from crm.commands.admin import require_agent
 from crm.commands.import_csv import import_app
 from crm.config import get_client
 from crm.normalize import normalize_email, normalize_linkedin
-from crm.output import err
+from crm.output import AGENT_HELP, err
 
 BATCH = 200
 HEADER_PREFIX = "First Name,Last Name,URL"
@@ -70,8 +70,9 @@ def _parse_connected_on(value: str | None) -> str | None:
 @import_app.command("linkedin")
 def import_linkedin(
     path: str = typer.Argument(..., help="Export zip or Connections.csv"),
-    agent: str = typer.Option("rahul", "--agent"),
+    agent: str = typer.Option("rahul", "--agent", help=AGENT_HELP),
 ):
+    """Stage your LinkedIn export — both people AND dated connection touchpoints."""
     client = get_client()
     require_agent(client, agent)
     rows = _read_connections(path)

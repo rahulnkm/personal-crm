@@ -20,7 +20,7 @@ from postgrest.exceptions import APIError
 from crm.closeness import CHANNEL_TIER, TIER_RANK
 from crm.commands.admin import require_agent
 from crm.config import get_client
-from crm.output import err
+from crm.output import AGENT_HELP, err
 
 PAGE = 100          # bulk in_ filters travel in the URL; 100 ids ~ 4 KB, safe
 MATCH_KEYS = ("email", "phone", "handle", "linkedin_url")
@@ -149,9 +149,9 @@ def backfill(
     retry_orphans: bool = typer.Option(False, "--retry-orphans",
                                        help="Re-attempt previously orphaned rows"),
     workers: int = typer.Option(4, "--workers", help="Parallel page workers (1-16)"),
-    agent: str = typer.Option("rahul", "--agent"),
+    agent: str = typer.Option("rahul", "--agent", help=AGENT_HELP),
 ):
-    """Link all pending staged touchpoints to contacts (batched + parallel)."""
+    """Link all pending staged touchpoints to contacts (batched + parallel). Run one invocation at a time."""
     workers = max(1, min(MAX_WORKERS, workers))
     client = get_client()
     require_agent(client, agent)
