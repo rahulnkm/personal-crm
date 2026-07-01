@@ -203,7 +203,7 @@ def _execute_cluster(client, items, state, lock):
 
 
 def _attach(client, staged: dict, contact_id: str) -> bool:
-    """Sequential single-row attach — used by `crm review --approve`. Idempotent
+    """Sequential single-row attach — used by `crm match review --approve`. Idempotent
     select-first identity guard (rerun_conflict patches staging + returns False),
     then fill-null + conflict-log. The bulk dedup path uses the batched _fold_auto
     fold instead; this preserves the manual-review callsite unchanged."""
@@ -247,7 +247,7 @@ def _create(client, staged: dict) -> str:
 
 def dedup(workers: int = typer.Option(4, "--workers", help="Parallel workers (1-16)"),
           agent: str = typer.Option("rahul", "--agent", help=AGENT_HELP)):
-    """Resolve pending staging rows into golden contacts: auto-attach matches, create new, queue ambiguous for crm review. Resumable."""
+    """Resolve pending staging rows into golden contacts: auto-attach matches, create new, queue ambiguous for crm match review. Resumable."""
     workers = max(1, min(MAX_WORKERS, workers))
     client = get_client()
     require_agent(client, agent)
@@ -287,7 +287,7 @@ def dedup(workers: int = typer.Option(4, "--workers", help="Parallel workers (1-
                f"{state['review']} queued for review, {state['rejected']} rejected "
                f"({workers} workers)")
     if state["review"]:
-        typer.echo("Next: crm review")
+        typer.echo("Next: crm match review")
     if state["errors"]:
         err(f"{len(state['errors'])} worker error(s); rerun to resume. First: {state['errors'][0]}")
         raise typer.Exit(1)
@@ -442,8 +442,8 @@ def _review_impl(approve, reject, to, as_json, agent):
         if approve:
             # guard: candidate contact may have been merged away (FK set null on delete)
             if not staged.get("matched_contact_id") and not to:
-                err("Candidate contact no longer exists — use `crm review --approve <id> --to <contact_id>` "
-                    "to pick a different contact, or `crm review --reject <id>` to create a new one.")
+                err("Candidate contact no longer exists — use `crm match review --approve <id> --to <contact_id>` "
+                    "to pick a different contact, or `crm match review --reject <id>` to create a new one.")
                 raise typer.Exit(1)
             # --to overrides the stored candidate
             target_id = to or staged["matched_contact_id"]
@@ -458,7 +458,7 @@ def _review_impl(approve, reject, to, as_json, agent):
                 ).eq("id", sid).execute()
                 typer.echo("approved")
             else:
-                err("conflict persists — see crm review")
+                err("conflict persists — see crm match review")
                 raise typer.Exit(1)
         else:
             # guard: rerun_conflict row's identity already lives on another contact
@@ -486,7 +486,7 @@ def _review_impl(approve, reject, to, as_json, agent):
         q["candidate"] = _candidate_display(maps, q)
     render(queue, as_json)
     if queue and not as_json:
-        typer.echo("\nResolve: crm review --approve <id> | crm review --reject <id>")
+        typer.echo("\nResolve: crm match review --approve <id> | crm match review --reject <id>")
 
 
 def review(
