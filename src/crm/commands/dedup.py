@@ -422,14 +422,11 @@ def _prefetch_display_maps(client, queue: list[dict]) -> dict:
     return {"contacts": contact_map, "identities": identity_map}
 
 
-def review(
-    approve: str = typer.Option(None, "--approve", help="staging id: confirm the match"),
-    reject: str = typer.Option(None, "--reject", help="staging id: not the same person"),
-    to: str = typer.Option(None, "--to", help="contact id to attach to (overrides stored candidate)"),
-    as_json: bool = typer.Option(False, "--json", help=JSON_HELP),
-    agent: str = typer.Option("rahul", "--agent", help=AGENT_HELP),
-):
-    """List the clerical-review queue, or resolve one row."""
+def _review_impl(approve, reject, to, as_json, agent):
+    """Shared body for the identity-match review queue. Both `crm match review`
+    (canonical) and the deprecated `crm review` alias call this — the alias only
+    adds a stderr disambiguation hint before delegating here, so the two entry
+    points can never diverge in behavior."""
     client = get_client()
     if approve and reject:
         err("Pass --approve OR --reject, not both.")
@@ -490,6 +487,31 @@ def review(
     render(queue, as_json)
     if queue and not as_json:
         typer.echo("\nResolve: crm review --approve <id> | crm review --reject <id>")
+
+
+def review(
+    approve: str = typer.Option(None, "--approve", help="staging id: confirm the match"),
+    reject: str = typer.Option(None, "--reject", help="staging id: not the same person"),
+    to: str = typer.Option(None, "--to", help="contact id to attach to (overrides stored candidate)"),
+    as_json: bool = typer.Option(False, "--json", help=JSON_HELP),
+    agent: str = typer.Option("rahul", "--agent", help=AGENT_HELP),
+):
+    """List or resolve the identity-match queue (staged imports the matcher couldn't auto-link). Distinct from crm enrich review."""
+    _review_impl(approve, reject, to, as_json, agent)
+
+
+def review_alias(
+    approve: str = typer.Option(None, "--approve", help="staging id: confirm the match"),
+    reject: str = typer.Option(None, "--reject", help="staging id: not the same person"),
+    to: str = typer.Option(None, "--to", help="contact id to attach to (overrides stored candidate)"),
+    as_json: bool = typer.Option(False, "--json", help=JSON_HELP),
+    agent: str = typer.Option("rahul", "--agent", help=AGENT_HELP),
+):
+    """Deprecated alias for `crm match review` (the identity-match queue). Distinct from crm enrich review."""
+    # stderr, not stdout — the hint must never corrupt --json output consumers read.
+    err("note: 'crm review' is the identity-match queue (now 'crm match review'); "
+        "for enrichment values use 'crm enrich review'.")
+    _review_impl(approve, reject, to, as_json, agent)
 
 
 def merge(

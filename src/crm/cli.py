@@ -8,7 +8,7 @@ from crm.commands.admin import agent_app, stats, sync_status, tags_app
 from crm.commands.contacts import add, contact, list_contacts, note, search, set_field
 from crm.commands.backfill import backfill
 from crm.commands.bulk import bulk_app
-from crm.commands.dedup import dedup, merge, review, split
+from crm.commands.dedup import dedup, merge, review, review_alias, split
 from crm.commands.enrich import enrich_app
 from crm.commands.import_csv import import_app
 import crm.commands.import_touchpoints  # noqa: F401  (registers import subcommand)
@@ -29,7 +29,13 @@ app.add_typer(bulk_app, name="bulk")
 app.command("stats")(stats)
 app.command("sync-status")(sync_status)
 app.command("dedup")(dedup)
-app.command("review")(review)
+
+# Canonical identity-match review lives under `crm match review`; the flat
+# `crm review` stays as a working, deprecated alias (same handler + a stderr hint).
+match_app = typer.Typer(help="Identity-match queue: review staged imports the matcher couldn't auto-link.")
+match_app.command("review")(review)
+app.add_typer(match_app, name="match")
+app.command("review")(review_alias)
 app.command("merge")(merge)
 app.command("split")(split)
 app.command("contact")(contact)
