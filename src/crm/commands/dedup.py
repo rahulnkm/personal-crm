@@ -17,7 +17,8 @@ from crm.matching import _is_role_email, classify, find_candidates
 from crm.output import AGENT_HELP, JSON_HELP, err, render
 
 FILL_FIELDS = {"current_role": "role", "current_company": "company",
-               "location": "location"}
+               "location": "location", "twitter_username": "twitter_username",
+               "github_username": "github_username", "website_url": "website_url"}
 PAGE = 1000  # PostgREST caps responses at 1,000 — page until drained
 MAX_WORKERS = 16
 FILL = FILL_FIELDS
@@ -236,7 +237,10 @@ def _create(client, staged: dict) -> str:
         {"full_name": staged["full_name"],
          "current_role": staged.get("role"),
          "current_company": staged.get("company"),
-         "location": staged.get("location")}
+         "location": staged.get("location"),
+         "twitter_username": staged.get("twitter_username"),
+         "github_username": staged.get("github_username"),
+         "website_url": staged.get("website_url")}
     ).execute().data[0]
     client.table("contact_identities").insert(
         {"contact_id": contact["id"],

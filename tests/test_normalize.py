@@ -54,3 +54,25 @@ def test_linkedin_mobile_port_and_encoding():
     assert normalize_linkedin("https://m.linkedin.com/in/rahul-n") == "linkedin.com/in/rahul-n"
     assert normalize_linkedin("https://linkedin.com:443/in/rahul-n") == "linkedin.com/in/rahul-n"
     assert normalize_linkedin("https://linkedin.com/in/rahul%2Dn") == "linkedin.com/in/rahul-n"
+
+
+def test_twitter_handle_forms():
+    from crm.normalize import normalize_twitter
+    assert normalize_twitter("https://x.com/AdaLovelace") == "adalovelace"
+    assert normalize_twitter("https://twitter.com/AdaLovelace/") == "adalovelace"
+    assert normalize_twitter("www.twitter.com/AdaLovelace") == "adalovelace"
+    assert normalize_twitter("@AdaLovelace") == "adalovelace"
+    assert normalize_twitter("AdaLovelace") == "adalovelace"
+    assert normalize_twitter("https://example.com/ada") is None  # wrong host
+    assert normalize_twitter("not a handle!") is None            # bad charset
+    assert normalize_twitter(None) is None
+
+
+def test_github_handle_forms():
+    from crm.normalize import normalize_github
+    assert normalize_github("https://github.com/AdaLovelace") == "adalovelace"
+    assert normalize_github("github.com/Ada-Lovelace") == "ada-lovelace"
+    assert normalize_github("@AdaLovelace") == "adalovelace"
+    assert normalize_github("ada-lovelace") == "ada-lovelace"
+    assert normalize_github("https://gitlab.com/ada") is None    # wrong host
+    assert normalize_github(None) is None

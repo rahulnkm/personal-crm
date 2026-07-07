@@ -1,7 +1,8 @@
 """Generic CSV → staging importer.
 
 --map binds staging fields to CSV headers: "full_name=Name,email=Email,company=Firm".
-Mappable fields: full_name, email, phone, linkedin_url, handle, role, company, location.
+Mappable fields: full_name, email, phone, linkedin_url, handle, role, company,
+location, twitter_username, github_username, website_url.
 Rows are upserted on (source, source_external_id) where the external id is a
 row-content hash — re-running an import (wifi drop, crash) creates no duplicates.
 """
@@ -13,13 +14,14 @@ import typer
 
 from crm.commands.admin import require_agent
 from crm.config import get_client
-from crm.normalize import normalize_email, normalize_linkedin, normalize_phone
+from crm.normalize import (normalize_email, normalize_github, normalize_linkedin,
+                           normalize_phone, normalize_twitter)
 from crm.output import AGENT_HELP, err
 
 import_app = typer.Typer(help="Importers. Everything lands in staging; run `crm dedup` after.")
 
 MAPPABLE = {"full_name", "email", "phone", "linkedin_url", "handle", "role", "company", "location",
-            "first_name", "last_name"}
+            "first_name", "last_name", "twitter_username", "github_username", "website_url"}
 BATCH = 200
 
 
@@ -92,6 +94,9 @@ def import_csv(
         rec["email"] = normalize_email(rec.get("email"))
         rec["phone"] = normalize_phone(rec.get("phone"))
         rec["linkedin_url"] = normalize_linkedin(rec.get("linkedin_url"))
+        rec["twitter_username"] = normalize_twitter(rec.get("twitter_username"))
+        rec["github_username"] = normalize_github(rec.get("github_username"))
+        # website_url stays as-is (whitespace already stripped) — no over-normalization
         digest = hashlib.sha256(
             json.dumps(raw, sort_keys=True).encode()
         ).hexdigest()[:32]  # hash covers all raw columns — if the CSV gains new columns on re-export, rows re-stage

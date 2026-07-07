@@ -59,6 +59,33 @@ def normalize_linkedin(value: str | None) -> str | None:
     return f"linkedin.com{path}"
 
 
+def _social_handle(value: str, hosts: set[str], pattern: str) -> str | None:
+    """URL / @handle / bare handle → bare lowercased handle, or None if it
+    doesn't resolve to a valid handle on the expected host (blank beats wrong)."""
+    v = value.strip().lower().removeprefix("@")
+    if "/" in v or "." in v:  # URL form, not a bare handle
+        u = v if v.startswith(("http://", "https://")) else "https://" + v
+        parsed = urlparse(u)
+        host = (parsed.hostname or "").removeprefix("www.").removeprefix("mobile.")
+        if host not in hosts:
+            return None
+        parts = unquote(parsed.path).strip("/").split("/")
+        v = parts[0] if parts else ""
+    return v if re.fullmatch(pattern, v) else None
+
+
+def normalize_twitter(value: str | None) -> str | None:
+    if not value:
+        return None
+    return _social_handle(value, {"twitter.com", "x.com"}, r"[a-z0-9_]{1,15}")
+
+
+def normalize_github(value: str | None) -> str | None:
+    if not value:
+        return None
+    return _social_handle(value, {"github.com"}, r"[a-z0-9](?:[a-z0-9-]{0,38})?")
+
+
 def normalize_name(value: str | None) -> str | None:
     if not value:
         return None

@@ -165,6 +165,9 @@ def build_plan(client, rows):
                     "role": r.get("role"),
                     "company": r.get("company"),
                     "location": r.get("location"),
+                    "twitter_username": r.get("twitter_username"),
+                    "github_username": r.get("github_username"),
+                    "website_url": r.get("website_url"),
                 },
             }
 
@@ -273,6 +276,9 @@ def build_plan(client, rows):
                         "current_role": r.get("role"),
                         "current_company": r.get("company"),
                         "location": r.get("location"),
+                        "twitter_username": r.get("twitter_username"),
+                        "github_username": r.get("github_username"),
+                        "website_url": r.get("website_url"),
                     },
                 })
                 resolved.append({
