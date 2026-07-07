@@ -14,7 +14,7 @@ from crm.commands.admin import require_agent
 from crm.commands.import_csv import import_app
 from crm.config import get_client
 from crm.normalize import normalize_email, normalize_phone
-from crm.output import err
+from crm.output import AGENT_HELP, err
 
 BATCH = 200
 DEFAULT_GLOBS = ["AddressBook-v22.abcddb", "Sources/*/AddressBook-v22.abcddb"]
@@ -87,8 +87,9 @@ def _rows_from(db_path: Path) -> list[dict]:
 def import_apple_contacts(
     db_path: str = typer.Option(None, "--db", help="Path to AddressBook-v22.abcddb "
                                                    "(default: auto-discover)"),
-    agent: str = typer.Option("rahul", "--agent"),
+    agent: str = typer.Option("rahul", "--agent", help=AGENT_HELP),
 ):
+    """Stage people from the macOS Address Book (needs Full Disk Access)."""
     client = get_client()
     require_agent(client, agent)
     path = Path(db_path) if db_path else _default_db()

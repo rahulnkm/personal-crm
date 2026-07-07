@@ -12,7 +12,7 @@ import typer
 
 from crm.commands.contacts import _safe_ilike, apply_contact_filters
 from crm.config import get_client
-from crm.output import err
+from crm.output import JSON_HELP, err
 
 # How far past PostgREST's 1,000-row response cap we page when materializing the
 # full capsule set. range() asks for [start, end] inclusive.
@@ -150,13 +150,9 @@ def capsules(
     company_category: str = typer.Option(None, "--company-category"),
     location: str = typer.Option(None, "--location"),
     cold_since: int = typer.Option(None, "--cold-since"),
-    as_json: bool = typer.Option(False, "--json"),
+    as_json: bool = typer.Option(False, "--json", help=JSON_HELP),
 ):
-    """Compact capsule per contact — the searchable representation for in-context match.
-
-    Accepts the same structured filters as `crm list` to pre-narrow the set. Pages
-    past PostgREST's 1,000-row response cap so the full network is materialized.
-    """
+    """One JSONL capsule per contact (the in-context match form); same filters as list, pages past the 1,000-row cap."""
     client = get_client()
 
     def query():
@@ -199,11 +195,9 @@ def find(
     role_class: str = typer.Option(None, "--role-class"),
     company_category: str = typer.Option(None, "--company-category"),
     location: str = typer.Option(None, "--location"),
-    as_json: bool = typer.Option(False, "--json"),
+    as_json: bool = typer.Option(False, "--json", help=JSON_HELP),
 ):
-    """Hybrid candidate retrieval: structural prefilter UNION keyword-overlap from the
-    intent, over capsule text columns + interaction topics. Returns the candidate POOL
-    — semantic ranking is the agent's job (it reads these capsules in-context)."""
+    """Find candidate contacts for a plain-language intent: filters + keyword overlap on capsule fields and recent touchpoint topics. Returns an unranked pool."""
     client = get_client()
     has_struct = any([status, tier, tag, affiliation, role, role_class,
                       company_category, location])

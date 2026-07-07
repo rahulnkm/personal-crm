@@ -14,7 +14,7 @@ from crm.commands.admin import require_agent
 from crm.config import get_client
 from crm.dedup_plan import IDENTITY_FIELDS, build_plan
 from crm.matching import _is_role_email, classify, find_candidates
-from crm.output import err, render
+from crm.output import AGENT_HELP, JSON_HELP, err, render
 
 FILL_FIELDS = {"current_role": "role", "current_company": "company",
                "location": "location"}
@@ -203,7 +203,7 @@ def _execute_cluster(client, items, state, lock):
 
 
 def _attach(client, staged: dict, contact_id: str) -> bool:
-    """Sequential single-row attach — used by `crm review --approve`. Idempotent
+    """Sequential single-row attach — used by `crm match review --approve`. Idempotent
     select-first identity guard (rerun_conflict patches staging + returns False),
     then fill-null + conflict-log. The bulk dedup path uses the batched _fold_auto
     fold instead; this preserves the manual-review callsite unchanged."""
@@ -246,10 +246,8 @@ def _create(client, staged: dict) -> str:
 
 
 def dedup(workers: int = typer.Option(4, "--workers", help="Parallel workers (1-16)"),
-          agent: str = typer.Option("rahul", "--agent")):
-    """Two-phase dedup: serial plan, parallel execute. A cluster is a write-isolation
-    unit; verdicts replay the sequential engine. Crash-resume is identity-keyed
-    (rerun re-plans pending rows; atomic-create + select-first prevent dupes)."""
+          agent: str = typer.Option("rahul", "--agent", help=AGENT_HELP)):
+    """Resolve pending staging rows into golden contacts: auto-attach matches, create new, queue ambiguous for crm match review. Resumable."""
     workers = max(1, min(MAX_WORKERS, workers))
     client = get_client()
     require_agent(client, agent)
@@ -289,7 +287,7 @@ def dedup(workers: int = typer.Option(4, "--workers", help="Parallel workers (1-
                f"{state['review']} queued for review, {state['rejected']} rejected "
                f"({workers} workers)")
     if state["review"]:
-        typer.echo("Next: crm review")
+        typer.echo("Next: crm match review")
     if state["errors"]:
         err(f"{len(state['errors'])} worker error(s); rerun to resume. First: {state['errors'][0]}")
         raise typer.Exit(1)
@@ -424,14 +422,11 @@ def _prefetch_display_maps(client, queue: list[dict]) -> dict:
     return {"contacts": contact_map, "identities": identity_map}
 
 
-def review(
-    approve: str = typer.Option(None, "--approve", help="staging id: confirm the match"),
-    reject: str = typer.Option(None, "--reject", help="staging id: not the same person"),
-    to: str = typer.Option(None, "--to", help="contact id to attach to (overrides stored candidate)"),
-    as_json: bool = typer.Option(False, "--json"),
-    agent: str = typer.Option("rahul", "--agent"),
-):
-    """List the clerical-review queue, or resolve one row."""
+def _review_impl(approve, reject, to, as_json, agent):
+    """Shared body for the identity-match review queue. Both `crm match review`
+    (canonical) and the deprecated `crm review` alias call this — the alias only
+    adds a stderr disambiguation hint before delegating here, so the two entry
+    points can never diverge in behavior."""
     client = get_client()
     if approve and reject:
         err("Pass --approve OR --reject, not both.")
@@ -447,8 +442,8 @@ def review(
         if approve:
             # guard: candidate contact may have been merged away (FK set null on delete)
             if not staged.get("matched_contact_id") and not to:
-                err("Candidate contact no longer exists — use `crm review --approve <id> --to <contact_id>` "
-                    "to pick a different contact, or `crm review --reject <id>` to create a new one.")
+                err("Candidate contact no longer exists — use `crm match review --approve <id> --to <contact_id>` "
+                    "to pick a different contact, or `crm match review --reject <id>` to create a new one.")
                 raise typer.Exit(1)
             # --to overrides the stored candidate
             target_id = to or staged["matched_contact_id"]
@@ -463,7 +458,7 @@ def review(
                 ).eq("id", sid).execute()
                 typer.echo("approved")
             else:
-                err("conflict persists — see crm review")
+                err("conflict persists — see crm match review")
                 raise typer.Exit(1)
         else:
             # guard: rerun_conflict row's identity already lives on another contact
@@ -491,13 +486,38 @@ def review(
         q["candidate"] = _candidate_display(maps, q)
     render(queue, as_json)
     if queue and not as_json:
-        typer.echo("\nResolve: crm review --approve <id> | crm review --reject <id>")
+        typer.echo("\nResolve: crm match review --approve <id> | crm match review --reject <id>")
+
+
+def review(
+    approve: str = typer.Option(None, "--approve", help="staging id: confirm the match"),
+    reject: str = typer.Option(None, "--reject", help="staging id: not the same person"),
+    to: str = typer.Option(None, "--to", help="contact id to attach to (overrides stored candidate)"),
+    as_json: bool = typer.Option(False, "--json", help=JSON_HELP),
+    agent: str = typer.Option("rahul", "--agent", help=AGENT_HELP),
+):
+    """List or resolve the identity-match queue (staged imports the matcher couldn't auto-link). Distinct from crm enrich review."""
+    _review_impl(approve, reject, to, as_json, agent)
+
+
+def review_alias(
+    approve: str = typer.Option(None, "--approve", help="staging id: confirm the match"),
+    reject: str = typer.Option(None, "--reject", help="staging id: not the same person"),
+    to: str = typer.Option(None, "--to", help="contact id to attach to (overrides stored candidate)"),
+    as_json: bool = typer.Option(False, "--json", help=JSON_HELP),
+    agent: str = typer.Option("rahul", "--agent", help=AGENT_HELP),
+):
+    """Deprecated alias for `crm match review` (the identity-match queue). Distinct from crm enrich review."""
+    # stderr, not stdout — the hint must never corrupt --json output consumers read.
+    err("note: 'crm review' is the identity-match queue (now 'crm match review'); "
+        "for enrichment values use 'crm enrich review'.")
+    _review_impl(approve, reject, to, as_json, agent)
 
 
 def merge(
     keep_id: str = typer.Argument(..., help="Contact to keep"),
     drop_id: str = typer.Argument(..., help="Contact to fold into the kept one"),
-    agent: str = typer.Option("rahul", "--agent"),
+    agent: str = typer.Option("rahul", "--agent", help=AGENT_HELP),
 ):
     """Manually fuse two contacts the matcher kept apart (under-merge fix)."""
     client = get_client()
@@ -544,9 +564,9 @@ def merge(
 
 
 def split(
-    contact_id: str = typer.Argument(...),
+    contact_id: str = typer.Argument(..., help="Contact the identity is wrongly merged into"),
     identity_id: str = typer.Argument(..., help="Identity to detach into a new contact"),
-    agent: str = typer.Option("rahul", "--agent"),
+    agent: str = typer.Option("rahul", "--agent", help=AGENT_HELP),
 ):
     """Detach a wrongly-merged identity into its own contact (over-merge fix)."""
     client = get_client()

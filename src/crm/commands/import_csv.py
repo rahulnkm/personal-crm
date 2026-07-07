@@ -14,7 +14,7 @@ import typer
 from crm.commands.admin import require_agent
 from crm.config import get_client
 from crm.normalize import normalize_email, normalize_linkedin, normalize_phone
-from crm.output import err
+from crm.output import AGENT_HELP, err
 
 import_app = typer.Typer(help="Importers. Everything lands in staging; run `crm dedup` after.")
 
@@ -61,8 +61,9 @@ def import_csv(
     file: str = typer.Argument(..., help="Path to the CSV"),
     source: str = typer.Option(..., "--source", help="Source slug, e.g. csv_rutgers_vc"),
     map_str: str = typer.Option(..., "--map", help="field=Header,field=Header"),
-    agent: str = typer.Option("rahul", "--agent"),
+    agent: str = typer.Option("rahul", "--agent", help=AGENT_HELP),
 ):
+    """Stage people from a CSV; --map binds staging columns to headers. Run crm dedup after."""
     client = get_client()
     require_agent(client, agent)
     mapping = _parse_map(map_str)

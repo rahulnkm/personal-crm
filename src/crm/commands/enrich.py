@@ -16,7 +16,7 @@ from crm.commands.admin import require_agent
 from crm.commands.contacts import _resolve
 from crm.config import get_client
 from crm.enrich import ARRAY_FIELDS, ATTRIBUTE, IDENTIFIER, EnrichCandidate, parse_payload
-from crm.output import err, render
+from crm.output import AGENT_HELP, JSON_HELP, err, render
 
 enrich_app = typer.Typer(help="Provenance-tracked enrichment: apply, review, undo, stats.")
 
@@ -33,10 +33,23 @@ def apply(
     ref: str = typer.Argument(..., help="Contact name or uuid"),
     file: str = typer.Option(None, "--file", help="JSON payload file (default: stdin)"),
     dry_run: bool = typer.Option(False, "--dry-run", help="Report outcomes, write nothing"),
-    agent: str = typer.Option("rahul", "--agent"),
-    as_json: bool = typer.Option(False, "--json"),
+    agent: str = typer.Option("rahul", "--agent", help=AGENT_HELP),
+    as_json: bool = typer.Option(False, "--json", help=JSON_HELP),
 ):
-    """Apply agent-discovered facts to a contact through the survivorship RPC."""
+    """Apply a JSON fact payload to a contact (scalars via survivorship, arrays via set-union).
+
+    Payload (stdin or --file), one field per entry:
+      [{"field": "current_company", "value": "Acme", "source": "gravatar", "confidence": 0.9}]
+
+    Per-field outcome:
+      golden  — now the live value
+      review  — queued for arbitration (crm enrich review)
+      added   — array element appended
+      noop    — identical value+source already present
+      losing  — lost to a previously tombstoned/higher-priority value
+
+    --dry-run reports the same outcomes without writing.
+    """
     client = get_client()
     require_agent(client, agent)
     raw = _read_payload(file)
@@ -97,15 +110,13 @@ def run(
     only_missing: bool = typer.Option(
         True, "--only-missing/--no-only-missing",
         help="Skip contacts already enriched or with no gaps a source would fill"),
-    as_json: bool = typer.Option(False, "--json"),
+    as_json: bool = typer.Option(False, "--json", help=JSON_HELP),
 ):
-    """Fetch deterministic public signal (Gravatar/GitHub) and apply via the RPC.
+    """Pull Gravatar/GitHub signal for in-network contacts (closeness-first) and apply it.
 
-    Walks the network closeness-first (t1 > t2 > … > none), runs each selected source
-    on the contact's primary email, and funnels every Candidate through
-    enrich_apply_candidate (method=enrich_api, source=<plugin>). Sets
-    contacts.last_enriched_at on success (unless --dry-run). Per-contact status is
-    always reported — never a silent skip.
+    Per-contact status: enriched (fields written) · skipped (--only-missing, no gaps) ·
+    no_email (no address to query) · reviewed (a value queued for arbitration) ·
+    no_signal (sources returned nothing new) · error (a source failed).
     """
     from datetime import date
 
@@ -226,7 +237,7 @@ def _due_contact_ids(client) -> set[str]:
 
 
 @enrich_app.command("due")
-def due(as_json: bool = typer.Option(False, "--json")):
+def due(as_json: bool = typer.Option(False, "--json", help=JSON_HELP)):
     """Contacts with a stale (past-refresh) field, closeness-ranked — feed to `run --due`."""
     client = get_client()
     ids = _due_contact_ids(client)
@@ -318,8 +329,8 @@ def review(
     skip: str = typer.Option(None, "--skip", help="Review id to skip"),
     approve_identity: str = typer.Option(
         None, "--approve-identity", help="candidate_identities id to promote to a live identity"),
-    agent: str = typer.Option("rahul", "--agent"),
-    as_json: bool = typer.Option(False, "--json"),
+    agent: str = typer.Option("rahul", "--agent", help=AGENT_HELP),
+    as_json: bool = typer.Option(False, "--json", help=JSON_HELP),
 ):
     """Arbitrate the enrichment review queue. Bare command lists open items."""
     client = get_client()
@@ -422,13 +433,9 @@ def _promote_identity(client, candidate_id: str, agent: str) -> None:
 @enrich_app.command("changes")
 def changes(
     since: str = typer.Option(..., "--since", help="ISO date/timestamp lower bound"),
-    as_json: bool = typer.Option(False, "--json"),
+    as_json: bool = typer.Option(False, "--json", help=JSON_HELP),
 ):
-    """Job changes (company/role transitions) from the provenance trail since a date.
-
-    Reads `enrichment_log` directly — the RPC already records old->new on every
-    materialization, so there's no extra write path.
-    """
+    """Job changes (company/role transitions) from the provenance trail since a date, e.g. --since 2026-01-01."""
     client = get_client()
     rows = (client.table("enrichment_log")
             .select("contact_id,field,old_value,new_value,created_at")
@@ -452,7 +459,7 @@ def changes(
 def undo(
     ref: str = typer.Argument(..., help="Contact name or uuid"),
     field: str = typer.Argument(..., help="Scalar field to revert"),
-    agent: str = typer.Option("rahul", "--agent"),
+    agent: str = typer.Option("rahul", "--agent", help=AGENT_HELP),
 ):
     """Revert the current (robot) value for a field and re-elect the prior winner.
 
@@ -479,10 +486,9 @@ def undo(
 @enrich_app.command("forget")
 def forget(
     ref: str = typer.Argument(..., help="Contact name or uuid"),
-    agent: str = typer.Option("rahul", "--agent"),
+    agent: str = typer.Option("rahul", "--agent", help=AGENT_HELP),
 ):
-    """Redact (right-to-be-forgotten) enrichment values for a contact, keeping the
-    structural provenance rows so the audit trail stays intact."""
+    """Wipe ALL enrichment values for a contact (irreversible); keeps empty provenance rows for audit."""
     client = get_client()
     require_agent(client, agent)
     c = _resolve(client, ref)
@@ -493,9 +499,8 @@ def forget(
 
 
 @enrich_app.command("stats")
-def stats(as_json: bool = typer.Option(False, "--json")):
-    """Enrichment coverage: current values by source, in-review queue, stale rows.
-    Head-count queries so counts stay exact past PostgREST's 1,000-row cap."""
+def stats(as_json: bool = typer.Option(False, "--json", help=JSON_HELP)):
+    """Enrichment coverage: current values by source, in-review queue, stale rows."""
     client = get_client()
     from datetime import date
 

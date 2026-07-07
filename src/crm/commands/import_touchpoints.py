@@ -17,7 +17,7 @@ from crm.commands.admin import require_agent
 from crm.commands.import_csv import _read_rows, import_app
 from crm.config import get_client
 from crm.normalize import normalize_email, normalize_linkedin, normalize_phone
-from crm.output import err
+from crm.output import AGENT_HELP, err
 
 MATCH_KEYS = {"email", "phone", "handle", "linkedin_url"}
 FIELDS = MATCH_KEYS | {"occurred_at", "summary", "event_name", "event_location",
@@ -51,8 +51,9 @@ def import_touchpoints(
     map_str: str = typer.Option(..., "--map", help="field=Header,… (incl. a match key)"),
     kind: str = typer.Option(..., "--kind", help="Default kind for rows without one"),
     channel: str = typer.Option(..., "--channel", help="Default channel for rows without one"),
-    agent: str = typer.Option("rahul", "--agent"),
+    agent: str = typer.Option("rahul", "--agent", help=AGENT_HELP),
 ):
+    """Stage dated touchpoints from a CSV (needs ≥1 match key). Run crm backfill after."""
     if kind not in VALID_KINDS:
         err(f"'{kind}' is not a valid kind. Valid: {sorted(VALID_KINDS)}")
         raise typer.Exit(1)

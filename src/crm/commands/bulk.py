@@ -14,7 +14,7 @@ from crm.bulk import CHUNK, URL_CHUNK, _emit, _gate
 from crm.commands.contacts import ARRAY_FIELDS, ENUM_VALUES, SETTABLE
 from crm.commands.log import VALID_KINDS, _bump_last_touchpoint_bulk, _validate_iso_date
 from crm.config import get_client
-from crm.output import err
+from crm.output import AGENT_HELP, JSON_HELP, err
 
 bulk_app = typer.Typer(help="Cohort-wide writes. Filter to a cohort, then apply.")
 
@@ -31,8 +31,8 @@ def bulk_set(
     all_: bool = typer.Option(False, "--all", help="Act on every contact (no filter)"),
     dry_run: bool = typer.Option(False, "--dry-run", help="Preview without writing"),
     yes: bool = typer.Option(False, "--yes", help="Required to apply a write"),
-    as_json: bool = typer.Option(False, "--json"),
-    agent: str = typer.Option("rahul", "--agent"),
+    as_json: bool = typer.Option(False, "--json", help=JSON_HELP),
+    agent: str = typer.Option("rahul", "--agent", help=AGENT_HELP),
 ):
     """Set a scalar field on every contact in the cohort. For tags use crm bulk tag."""
     if "=" not in assignment:
@@ -89,8 +89,8 @@ def bulk_tag(
     all_: bool = typer.Option(False, "--all", help="Act on every contact (no filter)"),
     dry_run: bool = typer.Option(False, "--dry-run", help="Preview without writing"),
     yes: bool = typer.Option(False, "--yes", help="Required to apply a write"),
-    as_json: bool = typer.Option(False, "--json"),
-    agent: str = typer.Option("rahul", "--agent"),
+    as_json: bool = typer.Option(False, "--json", help=JSON_HELP),
+    agent: str = typer.Option("rahul", "--agent", help=AGENT_HELP),
 ):
     """Add a tag to every contact in the cohort. Tag must exist in the registry."""
     client = get_client()
@@ -134,8 +134,8 @@ def bulk_log(
     all_: bool = typer.Option(False, "--all", help="Act on every contact (no filter)"),
     dry_run: bool = typer.Option(False, "--dry-run", help="Preview without writing"),
     yes: bool = typer.Option(False, "--yes", help="Required to apply a write"),
-    as_json: bool = typer.Option(False, "--json"),
-    agent: str = typer.Option("rahul", "--agent"),
+    as_json: bool = typer.Option(False, "--json", help=JSON_HELP),
+    agent: str = typer.Option("rahul", "--agent", help=AGENT_HELP),
 ):
     """Log a touchpoint against every contact in the cohort."""
     if kind not in VALID_KINDS:

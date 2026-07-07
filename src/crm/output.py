@@ -4,6 +4,11 @@ import sys
 
 import typer
 
+# Shared --option help strings, reused across every command so the phrasing is
+# identical everywhere.
+AGENT_HELP = "Registered writing agent for audit attribution"
+JSON_HELP = "Emit JSON instead of a table"
+
 
 def render(rows: list[dict], as_json: bool) -> None:
     if as_json:

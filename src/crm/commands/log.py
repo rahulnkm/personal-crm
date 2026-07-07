@@ -11,7 +11,7 @@ import crm.bulk as _bulk
 from crm.commands.admin import require_agent
 from crm.commands.contacts import _resolve
 from crm.config import get_client
-from crm.output import err
+from crm.output import AGENT_HELP, err
 
 VALID_KINDS = {"origin", "event", "email", "message", "call", "meeting"}
 
@@ -63,9 +63,9 @@ def log(
     channel: str = typer.Option(None, "--channel"),
     date: str = typer.Option(None, "--date", help="YYYY-MM-DD; default today"),
     summary: str = typer.Option(None, "--summary"),
-    agent: str = typer.Option("rahul", "--agent"),
+    agent: str = typer.Option("rahul", "--agent", help=AGENT_HELP),
 ):
-    """Log a 1:1 touchpoint."""
+    """Log one dated touchpoint with a contact; refreshes their last-contact fields."""
     if kind not in VALID_KINDS:
         err(f"'{kind}' is not a valid kind. Valid: {sorted(VALID_KINDS)}")
         raise typer.Exit(1)
@@ -90,7 +90,7 @@ def event_add(
     participants: str = typer.Option("", "--participants",
                                      help="Comma-separated contact ids/names"),
     notes: str = typer.Option(None, "--notes", help="Event-level notes"),
-    agent: str = typer.Option("rahul", "--agent"),
+    agent: str = typer.Option("rahul", "--agent", help=AGENT_HELP),
 ):
     """One event row + one linked interaction per participant."""
     _validate_iso_date(date)
@@ -151,7 +151,7 @@ def event_note(
     event_id: str = typer.Argument(...),
     ref: str = typer.Argument(..., help="Participant contact id/name"),
     text: str = typer.Argument(..., help="Per-person note within this event"),
-    agent: str = typer.Option("rahul", "--agent"),
+    agent: str = typer.Option("rahul", "--agent", help=AGENT_HELP),
 ):
     """Set/update the per-person summary on a participant's interaction row."""
     client = get_client()

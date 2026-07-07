@@ -3,7 +3,7 @@ import json
 import typer
 
 from crm.config import get_client
-from crm.output import err, render
+from crm.output import AGENT_HELP, JSON_HELP, err, render
 
 agent_app = typer.Typer(help="Registry of writing agents. Register before writing.")
 tags_app = typer.Typer(help="Tag registry — one definition per tag. Check before coining.")
@@ -34,6 +34,7 @@ def agent_register(
     agent_id: str = typer.Argument(..., help="Short slug, e.g. hiring-agent"),
     desc: str = typer.Option(..., "--desc", help="One line: what this agent is/does (its biases)"),
 ):
+    """Register (or update) a writing agent. Every mutating command requires a registered --agent."""
     client = get_client()
     client.table("agents").upsert(
         {"id": agent_id, "description": desc}, on_conflict="id"
@@ -42,7 +43,8 @@ def agent_register(
 
 
 @agent_app.command("list")
-def agent_list(as_json: bool = typer.Option(False, "--json")):
+def agent_list(as_json: bool = typer.Option(False, "--json", help=JSON_HELP)):
+    """List registered agents and their last-active time."""
     rows = get_client().table("agents").select("id,description,last_active").execute().data
     render(rows, as_json)
 
@@ -51,8 +53,9 @@ def agent_list(as_json: bool = typer.Option(False, "--json")):
 def tags_add(
     tag: str = typer.Argument(...),
     desc: str = typer.Option(..., "--desc", help="What the tag means and when to apply it"),
-    agent: str = typer.Option("rahul", "--agent"),
+    agent: str = typer.Option("rahul", "--agent", help=AGENT_HELP),
 ):
+    """Register a new tag + definition (fails if it exists)."""
     client = get_client()
     require_agent(client, agent)
     existing = client.table("tag_registry").select("tag,description").eq("tag", tag).execute().data
@@ -66,14 +69,14 @@ def tags_add(
 
 
 @tags_app.command("list")
-def tags_list(as_json: bool = typer.Option(False, "--json")):
+def tags_list(as_json: bool = typer.Option(False, "--json", help=JSON_HELP)):
+    """List every registered tag and its definition."""
     rows = get_client().table("tag_registry").select("tag,description").execute().data
     render(rows, as_json)
 
 
-def stats(as_json: bool = typer.Option(False, "--json")):
-    """Coverage: contacts by status/tier, staging by match_status. Single
-    crm_stats() RPC replaces the previous 16 head-count round-trips."""
+def stats(as_json: bool = typer.Option(False, "--json", help=JSON_HELP)):
+    """Coverage counts: contacts by connection_status and closeness_tier, staging + touchpoints by match_status."""
     client = get_client()
     raw = client.rpc("crm_stats", {}).execute().data or {}
     # PostgREST may unwrap a single-row set-returning function into a list
@@ -101,12 +104,10 @@ def sync_status(
         None, "--tier",
         help="Tier(s) that count as a real connection (repeatable). Default: t1+t2."),
     dry_run: bool = typer.Option(False, "--dry-run", help="Report the count without writing."),
-    agent: str = typer.Option("rahul", "--agent"),
-    as_json: bool = typer.Option(False, "--json"),
+    agent: str = typer.Option("rahul", "--agent", help=AGENT_HELP),
+    as_json: bool = typer.Option(False, "--json", help=JSON_HELP),
 ):
-    """Promote contacts with a real touchpoint tier to in_network. Additive and
-    idempotent: only flips contact_on_file rows, never demotes a manual in_network.
-    Re-run after imports to mark newly-tiered people as real connections."""
+    """Flag contact_on_file people who now have a real touchpoint as in_network (never demotes). Re-run after imports."""
     client = get_client()
     require_agent(client, agent)
     tiers = tier or list(PROMOTE_TIERS)

@@ -17,7 +17,7 @@ from crm.commands.admin import require_agent
 from crm.commands.import_csv import import_app
 from crm.config import get_client
 from crm.normalize import normalize_email, normalize_phone
-from crm.output import err
+from crm.output import AGENT_HELP, err
 
 BATCH = 200
 APPLE_EPOCH_OFFSET = 978_307_200  # 2001-01-01 vs 1970-01-01, seconds
@@ -36,8 +36,9 @@ def _apple_ns_to_date(ns: int | None) -> str | None:
 @import_app.command("imessage")
 def import_imessage(
     db_path: str = typer.Option(str(DEFAULT_DB), "--db", help="Path to chat.db"),
-    agent: str = typer.Option("rahul", "--agent"),
+    agent: str = typer.Option("rahul", "--agent", help=AGENT_HELP),
 ):
+    """Stage iMessage history as touchpoints. Run import apple-contacts + dedup FIRST."""
     client = get_client()
     require_agent(client, agent)
     path = Path(db_path)
