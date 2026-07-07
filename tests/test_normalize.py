@@ -63,6 +63,9 @@ def test_twitter_handle_forms():
     assert normalize_twitter("www.twitter.com/AdaLovelace") == "adalovelace"
     assert normalize_twitter("@AdaLovelace") == "adalovelace"
     assert normalize_twitter("AdaLovelace") == "adalovelace"
+    assert normalize_twitter("https://x.com/AdaLovelace/status/123") == "adalovelace"
+    assert normalize_twitter("https://x.com/i/status/123") is None       # reserved route
+    assert normalize_twitter("https://twitter.com/intent/follow?screen_name=ada") is None
     assert normalize_twitter("https://example.com/ada") is None  # wrong host
     assert normalize_twitter("not a handle!") is None            # bad charset
     assert normalize_twitter(None) is None
@@ -74,5 +77,11 @@ def test_github_handle_forms():
     assert normalize_github("github.com/Ada-Lovelace") == "ada-lovelace"
     assert normalize_github("@AdaLovelace") == "adalovelace"
     assert normalize_github("ada-lovelace") == "ada-lovelace"
+    assert normalize_github("a-b") == "a-b"
+    assert normalize_github("a" * 39) == "a" * 39                # at the 39-char cap
+    assert normalize_github("https://github.com/orgs/anthropics") is None  # reserved route
+    assert normalize_github("ada-") is None                      # trailing hyphen
+    assert normalize_github("a--b") is None                      # consecutive hyphens
+    assert normalize_github("a" * 40) is None                    # over the cap
     assert normalize_github("https://gitlab.com/ada") is None    # wrong host
     assert normalize_github(None) is None

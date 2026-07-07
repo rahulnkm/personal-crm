@@ -59,7 +59,16 @@ def normalize_linkedin(value: str | None) -> str | None:
     return f"linkedin.com{path}"
 
 
-def _social_handle(value: str, hosts: set[str], pattern: str) -> str | None:
+# first URL path segment on these hosts can be a site route, not a profile —
+# extracting it would mint a wrong handle (blank beats wrong)
+_TWITTER_RESERVED = {"i", "intent", "home", "search", "hashtag", "explore",
+                     "share", "settings", "messages", "notifications"}
+_GITHUB_RESERVED = {"orgs", "features", "topics", "trending", "settings",
+                    "marketplace", "sponsors", "about"}
+
+
+def _social_handle(value: str, hosts: set[str], pattern: str,
+                   reserved: set[str]) -> str | None:
     """URL / @handle / bare handle → bare lowercased handle, or None if it
     doesn't resolve to a valid handle on the expected host (blank beats wrong)."""
     v = value.strip().lower().removeprefix("@")
@@ -71,19 +80,24 @@ def _social_handle(value: str, hosts: set[str], pattern: str) -> str | None:
             return None
         parts = unquote(parsed.path).strip("/").split("/")
         v = parts[0] if parts else ""
+    if v in reserved:
+        return None
     return v if re.fullmatch(pattern, v) else None
 
 
 def normalize_twitter(value: str | None) -> str | None:
     if not value:
         return None
-    return _social_handle(value, {"twitter.com", "x.com"}, r"[a-z0-9_]{1,15}")
+    return _social_handle(value, {"twitter.com", "x.com"},
+                          r"[a-z0-9_]{1,15}", _TWITTER_RESERVED)
 
 
 def normalize_github(value: str | None) -> str | None:
     if not value:
         return None
-    return _social_handle(value, {"github.com"}, r"[a-z0-9](?:[a-z0-9-]{0,38})?")
+    # no leading/trailing/consecutive hyphens; GitHub's 39-char cap via lookahead
+    return _social_handle(value, {"github.com"},
+                          r"(?=.{1,39}$)[a-z0-9]+(?:-[a-z0-9]+)*", _GITHUB_RESERVED)
 
 
 def normalize_name(value: str | None) -> str | None:
