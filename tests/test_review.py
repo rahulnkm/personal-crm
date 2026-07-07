@@ -151,7 +151,7 @@ def test_render_parity_conflict_and_fuzzy(db):
     assert r.exit_code == 0
 
     import json
-    rows = json.loads(r.output)
+    rows = json.loads(r.stdout)
     by_id = {row["id"]: row for row in rows}
 
     assert conflict_row["id"] in by_id, "conflict row missing from review output"
@@ -336,7 +336,7 @@ def test_identity_discovered_candidate_second_pass(db):
     assert r.exit_code == 0
 
     import json
-    rows_out = json.loads(r.output)
+    rows_out = json.loads(r.stdout)
     by_id = {r_["id"]: r_ for r_ in rows_out}
     assert row["id"] in by_id, "staging row missing from review output"
     assert "Diana Prince" in by_id[row["id"]]["candidate"]
