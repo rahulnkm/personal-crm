@@ -61,7 +61,7 @@ def test_fold_attached_vs_conflict_outcomes():
     deref = lambda r: r
 
     id_inserts, enrich_rows, fills, outcomes = _fold_auto(
-        [it_ok, it_conf], deref, contact_by_id, existing)
+        [it_ok, it_conf], deref, contact_by_id, existing, elected=set())
 
     assert outcomes["rowA"] == "attached"
     assert outcomes["rowB"] == "conflict"
@@ -84,10 +84,18 @@ def test_fold_cross_item_fill_earlier_wins_later_logs_against_accumulator():
     deref = lambda r: r
 
     id_inserts, enrich_rows, fills, outcomes = _fold_auto(
-        [it1, it2], deref, contact_by_id, existing={})
+        [it1, it2], deref, contact_by_id, existing={}, elected=set())
 
     assert fills["C1"]["current_company"] == "FirstCo"   # earlier wins
-    conflicts = [r for r in enrich_rows if r["field"] == "current_company"]
+    # the applied fill logs itself (elected), the losing value logs a conflict
+    fill_logs = [r for r in enrich_rows
+                 if r["field"] == "current_company" and r["method"] == "import_fill"]
+    assert len(fill_logs) == 1
+    assert fill_logs[0]["new_value"] == "FirstCo"
+    assert fill_logs[0]["source"] == "srcA"
+    assert fill_logs[0]["is_current"] is True
+    conflicts = [r for r in enrich_rows
+                 if r["field"] == "current_company" and r["method"] == "import_conflict"]
     assert len(conflicts) == 1
     c = conflicts[0]
     assert c["old_value"] == "FirstCo"     # accumulator value, not pre-cluster null
@@ -105,7 +113,7 @@ def test_fold_same_contact_existing_identity_no_reinsert_still_fills():
     deref = lambda r: r
 
     id_inserts, enrich_rows, fills, outcomes = _fold_auto(
-        [it], deref, contact_by_id, existing)
+        [it], deref, contact_by_id, existing, elected=set())
 
     assert id_inserts == []                          # no re-insert
     assert outcomes["r1"] == "attached"
@@ -121,7 +129,7 @@ def test_fold_identity_conflict_routes_to_conflict_no_fill():
     deref = lambda r: r
 
     id_inserts, enrich_rows, fills, outcomes = _fold_auto(
-        [it], deref, contact_by_id, existing)
+        [it], deref, contact_by_id, existing, elected=set())
 
     assert outcomes["r1"] == "conflict"
     assert id_inserts == []
@@ -138,7 +146,7 @@ def test_fold_full_name_conflict_logged():
     deref = lambda r: r
 
     id_inserts, enrich_rows, fills, outcomes = _fold_auto(
-        [it], deref, contact_by_id, existing={})
+        [it], deref, contact_by_id, existing={}, elected=set())
 
     name_logs = [r for r in enrich_rows if r["field"] == "full_name"]
     assert len(name_logs) == 1
@@ -157,7 +165,7 @@ def test_fold_deref_create_key_before_contact_lookup():
     deref = lambda r: "REAL" if r == "ck:1" else r
 
     id_inserts, enrich_rows, fills, outcomes = _fold_auto(
-        [it], deref, contact_by_id, existing={})
+        [it], deref, contact_by_id, existing={}, elected=set())
 
     assert outcomes["r1"] == "attached"
     assert fills["REAL"]["current_company"] == "Acme"

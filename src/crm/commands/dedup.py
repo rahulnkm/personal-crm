@@ -34,26 +34,59 @@ def _load_pending(client):
             return out
 
 
+def _fill_row(contact_id, field, value, source, source_external_id):
+    """enrichment_log row for an APPLIED fill — elected (is_current) so undo/stats/
+    old_value lookups see it. Provenance points back at the exact staging row."""
+    return {"contact_id": contact_id, "field": field, "new_value": value,
+            "source": source, "method": "import_fill",
+            "source_detail": f"staging {source}/{source_external_id}",
+            "is_current": True}
+
+
+def _conflict_row(contact_id, field, old, new, source):
+    """Rejected value — pinned is_current=false (electing it would both lie and
+    collide with the partial unique index on elected rows)."""
+    return {"contact_id": contact_id, "field": field, "old_value": old,
+            "new_value": new, "source": source, "method": "import_conflict",
+            "is_current": False}
+
+
+def _elected_pairs(client, contact_ids):
+    """{(contact_id, field)} with an is_current row — a NULL golden column can still
+    carry a deliberate manual_set NULL clear, which a fill must not override."""
+    if not contact_ids:
+        return set()
+    rows = (client.table("enrichment_log").select("contact_id,field")
+            .in_("contact_id", sorted(contact_ids)).eq("is_current", True)
+            .in_("field", sorted(FILL)).execute().data)
+    return {(r["contact_id"], r["field"]) for r in rows}
+
+
 def _fill_and_log(client, contact_id, staged, source):
     contact = client.table("contacts").select("*").eq("id", contact_id).single().execute().data
-    updates, conflicts = {}, []
+    elected = _elected_pairs(client, [contact_id])
+    updates, log_rows = {}, []
+    sxid = staged.get("source_external_id")
     for cf, sf in FILL.items():
         new = staged.get(sf)
         if not new:
             continue
         if not contact.get(cf):
-            updates[cf] = new
+            if (contact_id, cf) in elected:              # deliberate clear wins
+                log_rows.append(_conflict_row(contact_id, cf, None, new, source))
+            else:
+                updates[cf] = new
+                log_rows.append(_fill_row(contact_id, cf, new, source, sxid))
         elif contact[cf] != new:
-            conflicts.append((cf, contact[cf], new))
+            log_rows.append(_conflict_row(contact_id, cf, contact[cf], new, source))
     if staged.get("full_name") and staged["full_name"] != contact["full_name"]:
-        conflicts.append(("full_name", contact["full_name"], staged["full_name"]))
+        log_rows.append(_conflict_row(contact_id, "full_name",
+                                      contact["full_name"], staged["full_name"], source))
     if updates:
         updates["updated_at"] = "now()"
         client.table("contacts").update(updates).eq("id", contact_id).execute()
-    if conflicts:
-        client.table("enrichment_log").insert(
-            [{"contact_id": contact_id, "field": f, "old_value": o, "new_value": n,
-              "source": source, "method": "import_conflict"} for f, o, n in conflicts]).execute()
+    if log_rows:
+        client.table("enrichment_log").insert(log_rows).execute()
 
 
 def _patch(it, status, contact_id, conf=None, method=None, resolved=True):
@@ -74,7 +107,7 @@ def _bump(state, lock, key):
         state[key] += 1
 
 
-def _fold_auto(auto, deref, contact_by_id, existing):
+def _fold_auto(auto, deref, contact_by_id, existing, elected):
     """PURE in-memory replay of the sequential auto_matched path (no DB).
 
     Walks `auto` items in plan order and reproduces _attach_identity + _fill_and_log
@@ -86,10 +119,13 @@ def _fold_auto(auto, deref, contact_by_id, existing):
         deref: create_key→uuid resolver (identity for already-real uuids).
         contact_by_id: {contact_uuid: contact-row dict} for every dereferenced target.
         existing: {(source, source_external_id): contact_id} prefetched DB identity map.
+        elected: {(contact_id, field)} with an is_current enrichment_log row — a NULL
+            column there is a deliberate manual clear; the fold must skip-and-conflict,
+            not fill (fill would also collide with the elected-row unique index).
 
     Returns:
         id_inserts: list of contact_identities rows to insert-or-ignore.
-        enrich_rows: list of enrichment_log rows (import_conflict).
+        enrich_rows: list of enrichment_log rows (import_fill + import_conflict).
         fills: {contact_id: {field: value}} fill-null updates, one per contact.
         outcomes: {item_id: "attached" | "conflict"}.
     """
@@ -117,17 +153,18 @@ def _fold_auto(auto, deref, contact_by_id, existing):
             if not new:
                 continue
             if not acc[cid].get(cf):
+                if (cid, cf) in elected:             # deliberate clear wins
+                    enrich_rows.append(_conflict_row(cid, cf, None, new, it["source"]))
+                    continue
                 fills.setdefault(cid, {})[cf] = new
                 acc[cid][cf] = new                   # WRITE BACK
+                enrich_rows.append(_fill_row(cid, cf, new, it["source"],
+                                             it["source_external_id"]))
             elif acc[cid][cf] != new:
-                enrich_rows.append({"contact_id": cid, "field": cf, "old_value": acc[cid][cf],
-                                    "new_value": new, "source": it["source"],
-                                    "method": "import_conflict"})
+                enrich_rows.append(_conflict_row(cid, cf, acc[cid][cf], new, it["source"]))
         if staged.get("full_name") and staged["full_name"] != acc[cid].get("full_name"):
-            enrich_rows.append({"contact_id": cid, "field": "full_name",
-                                "old_value": acc[cid].get("full_name"),
-                                "new_value": staged["full_name"], "source": it["source"],
-                                "method": "import_conflict"})
+            enrich_rows.append(_conflict_row(cid, "full_name", acc[cid].get("full_name"),
+                                             staged["full_name"], it["source"]))
         outcomes[it["id"]] = "attached"
     return id_inserts, enrich_rows, fills, outcomes
 
@@ -161,8 +198,9 @@ def _execute_cluster(client, items, state, lock):
                   .in_("source_external_id", sxids[i:i + 100]).execute().data):
             existing[(r["source"], r["source_external_id"])] = r["contact_id"]
 
+    elected = _elected_pairs(client, cids)         # manual clears the fold must respect
     id_inserts, enrich_rows, fills, outcomes = _fold_auto(
-        auto, deref, contact_by_id, existing)
+        auto, deref, contact_by_id, existing, elected)
 
     if id_inserts:
         # insert-or-ignore via RPC: PostgREST .upsert() can't target the PARTIAL
