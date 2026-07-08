@@ -273,6 +273,46 @@ def test_execute_duplicate_keys_two_rows_one_cluster_no_abort(db):
     assert len(db.table("contacts").select("id").execute().data) == 1
 
 
+def test_execute_create_then_attach_fill_no_index_violation(db):
+    """Freeze the merged-insert safety invariant: one cluster with a CREATE plus a
+    second row that auto-attaches to the just-created contact and fills a birth-null
+    field. Index-safe only because contact_by_id is re-read AFTER the create RPC —
+    fills target fields the re-read shows null (no birth row), so the elected-row
+    partial unique index never sees two is_current rows for one (contact, field)."""
+    db.table("staging").insert([
+        # r1: no match anywhere -> creates the contact (company set, location null)
+        {"source": "s", "source_external_id": "r1", "full_name": "Ada Lovelace",
+         "email": "ada@x.co", "company": "Analytical", "match_status": "pending",
+         "imported_at": "2020-01-01T00:00:01Z"},
+        # r2: same email -> attaches to r1's create_key; fills the birth-null
+        # location AND conflicts on the birth-set company
+        {"source": "s", "source_external_id": "r2", "full_name": "Ada Lovelace",
+         "email": "ada@x.co", "company": "Difference Engine", "location": "London",
+         "match_status": "pending", "imported_at": "2020-01-01T00:00:02Z"},
+    ]).execute()
+    spy, state = _run_cluster(db, _plan_one_cluster(db))          # must not abort
+    assert state["created"] == 1 and state["auto"] == 1
+    c = db.table("contacts").select("*").execute().data
+    assert len(c) == 1
+    assert c[0]["current_company"] == "Analytical"                # birth value survives
+    assert c[0]["location"] == "London"                           # birth-null filled
+    log = db.table("enrichment_log").select("*").eq("contact_id", c[0]["id"])\
+        .execute().data
+    births = {r["field"]: r for r in log if r["method"] == "import_create"}
+    assert set(births) == {"full_name", "current_company"}
+    assert all(r["is_current"] and r["source_detail"] == "staging s/r1"
+               for r in births.values())
+    fills = [r for r in log if r["method"] == "import_fill"]
+    assert [(r["field"], r["new_value"], r["is_current"], r["source_detail"])
+            for r in fills] == [("location", "London", True, "staging s/r2")]
+    conflicts = [r for r in log if r["method"] == "import_conflict"]
+    assert [(r["field"], r["old_value"], r["new_value"], r["is_current"],
+             r["source_detail"]) for r in conflicts] == \
+        [("current_company", "Analytical", "Difference Engine", False, "staging s/r2")]
+    # births + fill + conflict all rode ONE enrichment_log insert
+    assert spy.count("enrichment_log", "insert") == 1
+
+
 def _stage_k_auto(db, k):
     """Seed one existing contact + K staging rows that all auto-match it (distinct
     emails, all already-known on the SAME contact so they attach, distinct sxids)."""

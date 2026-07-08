@@ -34,12 +34,17 @@ def _load_pending(client):
             return out
 
 
+def _staging_detail(source, source_external_id):
+    """Canonical source_detail pointer back at the exact staging row."""
+    return f"staging {source}/{source_external_id}"
+
+
 def _fill_row(contact_id, field, value, source, source_external_id):
     """enrichment_log row for an APPLIED fill — elected (is_current) so undo/stats/
     old_value lookups see it. Provenance points back at the exact staging row."""
     return {"contact_id": contact_id, "field": field, "new_value": value,
             "source": source, "method": "import_fill",
-            "source_detail": f"staging {source}/{source_external_id}",
+            "source_detail": _staging_detail(source, source_external_id),
             "is_current": True}
 
 
@@ -49,7 +54,7 @@ def _conflict_row(contact_id, field, old, new, source, source_external_id):
     pointer so N same-cluster conflicts on one field stay distinguishable."""
     return {"contact_id": contact_id, "field": field, "old_value": old,
             "new_value": new, "source": source, "method": "import_conflict",
-            "source_detail": f"staging {source}/{source_external_id}",
+            "source_detail": _staging_detail(source, source_external_id),
             "is_current": False}
 
 
@@ -58,7 +63,7 @@ def _birth_rows(contact_id, fields, source, source_external_id):
     (is_current): the contact has no prior rows, so no elected-index collision."""
     return [{"contact_id": contact_id, "field": f, "new_value": v,
              "source": source, "method": "import_create",
-             "source_detail": f"staging {source}/{source_external_id}",
+             "source_detail": _staging_detail(source, source_external_id),
              "is_current": True}
             for f, v in fields.items() if v]
 
@@ -230,6 +235,9 @@ def _execute_cluster(client, items, state, lock):
         # guarantees a duplicate/pre-existing identity never aborts the batch.
         client.rpc("bulk_insert_identities", {"payload": id_inserts}).execute()
     if birth_rows or enrich_rows:
+        # index-safe merge: contact_by_id is re-read AFTER the create RPC, so fold
+        # fills only target fields that re-read shows null — fields with no birth
+        # row. One (contact, field) never gets two is_current rows in this insert.
         client.table("enrichment_log").insert(birth_rows + enrich_rows).execute()
     for cid, upd in fills.items():
         client.table("contacts").update({**upd, "updated_at": "now()"}).eq("id", cid).execute()
