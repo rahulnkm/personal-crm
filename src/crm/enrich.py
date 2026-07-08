@@ -9,6 +9,7 @@ The enrich write-path funnels through two kinds of facts:
 Keeping this module DB-free makes it unit-testable without a stack.
 """
 import json
+import re
 from dataclasses import dataclass, field as dc_field
 
 ATTRIBUTE = "attribute"
@@ -42,6 +43,48 @@ class EnrichCandidate:
     source: str = ""
     source_detail: str | None = None
     evidence: str | None = None
+
+
+# ----- apply-time validation gate (agent writes only; manual set/note/add never
+# ----- pass through apply, so their exemption is structural, not flagged) -----
+
+# narrative fields whose claims must carry a grounding span in source_detail
+NARRATIVE_FIELDS = {"origin_context", "notes"}
+# minimum source_detail length for narrative/expertise writes. Length+presence
+# only — a >=20-char pointer still passes; span-ness isn't machine-checkable here.
+MIN_SOURCE_DETAIL_LEN = 20
+# expertise elements are typed facets: tool|skill|role|domain, then a kebab slug
+EXPERTISE_FACET_RE = re.compile(r"^(tool|skill|role|domain):[a-z0-9-]+$")
+
+_SPAN_ERR = (
+    f"needs source_detail of >={MIN_SOURCE_DETAIL_LEN} chars quoting the span the claim "
+    "came from — the actual words (message/email/page text). A pointer to where you "
+    "looked (a phone number + date range is not a span) doesn't let anyone verify the claim."
+)
+
+
+def gate_candidate(cand: EnrichCandidate) -> tuple[str, str] | None:
+    """Pre-write check for narrative/expertise candidates.
+
+    Returns (outcome, error) — 'rejected_bad_facet' or 'rejected_ungrounded' —
+    or None if the candidate may proceed to the RPCs. Other fields pass untouched.
+    """
+    if cand.field == "expertise":
+        v = (cand.value or "").strip()
+        if v.startswith("["):
+            return ("rejected_bad_facet",
+                    "expertise element looks like a stringified JSON array "
+                    f"({v[:40]!r}) — send one facet per candidate, not the array "
+                    "serialized into a single element")
+        if not EXPERTISE_FACET_RE.match(v):
+            return ("rejected_bad_facet",
+                    f"expertise element {v!r} must match "
+                    "^(tool|skill|role|domain):[a-z0-9-]+$ (lowercase kebab slug)")
+    if cand.field in NARRATIVE_FIELDS or cand.field == "expertise":
+        detail = (cand.source_detail or "").strip()
+        if len(detail) < MIN_SOURCE_DETAIL_LEN:
+            return ("rejected_ungrounded", f"{cand.field} {_SPAN_ERR}")
+    return None
 
 
 def _one(obj: dict) -> EnrichCandidate:

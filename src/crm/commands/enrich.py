@@ -15,7 +15,8 @@ import typer
 from crm.commands.admin import require_agent
 from crm.commands.contacts import _resolve
 from crm.config import get_client
-from crm.enrich import ARRAY_FIELDS, ATTRIBUTE, IDENTIFIER, EnrichCandidate, parse_payload
+from crm.enrich import (ARRAY_FIELDS, ATTRIBUTE, IDENTIFIER, EnrichCandidate,
+                        gate_candidate, parse_payload)
 from crm.output import AGENT_HELP, JSON_HELP, err, render
 
 enrich_app = typer.Typer(help="Provenance-tracked enrichment: apply, review, undo, stats.")
@@ -47,6 +48,8 @@ def apply(
       added   — array element appended
       noop    — identical value+source already present
       losing  — lost to a previously tombstoned/higher-priority value
+      rejected_ungrounded — narrative/expertise skipped: source_detail missing or <20 chars (no grounding span)
+      rejected_bad_facet  — expertise skipped: element not type:slug (or a stringified JSON array)
 
     --dry-run reports the same outcomes without writing.
     """
@@ -62,6 +65,11 @@ def apply(
 
     results = []
     for cand in candidates:
+        rejection = gate_candidate(cand)  # per-field skip, never a hard exit
+        if rejection:
+            outcome, msg = rejection
+            results.append({"field": cand.field, "outcome": outcome, "error": msg})
+            continue
         if cand.kind == ATTRIBUTE:
             # array attributes (expertise/interests/tags/affiliations) accumulate via
             # the set-union RPC; scalar attributes go through survivorship.
@@ -80,7 +88,8 @@ def apply(
         typer.echo(json.dumps(results, default=str))
     else:
         for r in results:
-            typer.echo(f"{r['field']}: {r['outcome']}")
+            typer.echo(f"{r['field']}: {r['outcome']}"
+                       + (f" — {r['error']}" if "error" in r else ""))
 
 
 # closeness priority: t1 first … none last. in_network beats contact_on_file within a tier.

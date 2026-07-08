@@ -86,7 +86,8 @@ def test_apply_array_field_routes_to_array_rpc(db):
     db.table("agents").upsert({"id": "claude-web", "description": "test"}, on_conflict="id").execute()
     c = db.table("contacts").insert({"full_name": "Exp Person"}).execute().data[0]
     r = runner.invoke(app, ["enrich", "apply", c["id"], "--agent", "claude-web", "--json"],
-                      input='{"field":"expertise","value":"role:investor","confidence":0.9,"source":"agent:claude-web"}')
+                      input='{"field":"expertise","value":"role:investor","confidence":0.9,"source":"agent:claude-web",'
+                            '"source_detail":"\\"led the seed round in our Jan 2026 call\\""}')
     assert r.exit_code == 0, r.output
     assert "added" in r.output
     got = db.table("contacts").select("expertise").eq("id", c["id"]).single().execute().data["expertise"]

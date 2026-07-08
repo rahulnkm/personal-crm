@@ -103,7 +103,8 @@ def test_cli_enrich_apply_routes_array_field(db):
     db.table("agents").upsert({"id": "claude-web", "description": "t"}, on_conflict="id").execute()
     c = db.table("contacts").insert({"full_name": "Gus"}).execute().data[0]
     r = runner.invoke(app, ["enrich", "apply", c["id"], "--agent", "claude-web", "--json"],
-                      input='{"field":"expertise","value":"role:investor","confidence":0.9,"source":"agent:claude-web"}')
+                      input='{"field":"expertise","value":"role:investor","confidence":0.9,"source":"agent:claude-web",'
+                            '"source_detail":"\\"led the seed round in our Jan 2026 call\\""}')
     assert r.exit_code == 0, r.output
     assert "added" in r.output
     assert _arr(db, c["id"], "expertise") == ["role:investor"]
