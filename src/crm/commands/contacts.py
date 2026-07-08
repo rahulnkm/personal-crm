@@ -361,9 +361,17 @@ def note(
     client = get_client()
     require_agent(client, agent)
     c = _resolve(client, ref)
-    # attribution prefix is informational, not tamper-proof — notes are freeform by design (authoritative audit lives in enrichment_log for set/merge/split)
+    # attribution prefix is informational, not tamper-proof — notes are freeform by design
     stamped = f"[{date.today().isoformat()} {agent}] {text}"
     notes = (c.get("notes") + "\n" + stamped) if c.get("notes") else stamped
-    client.table("contacts").update(
-        {"notes": notes, "updated_at": "now()"}).eq("id", c["id"]).execute()
+    # route through the survivorship RPC as a sacred manual write — the log row
+    # carries the full new blob; source_detail carries just the appended text.
+    outcome = client.rpc("enrich_apply_candidate", {
+        "p_contact_id": c["id"], "p_field": "notes", "p_value": notes,
+        "p_method": "manual_set", "p_source": agent, "p_confidence": 1.0,
+        "p_source_detail": text, "p_dry_run": False,
+    }).execute().data
+    if outcome != "golden":
+        err(f"note did not land: survivorship returned '{outcome}'")
+        raise typer.Exit(1)
     typer.echo("noted")

@@ -77,6 +77,84 @@ def test_contact_json_graceful_without_provenance(db):
     assert out["provenance"] == {}  # no is_current rows → empty map, no error
 
 
+def test_note_writes_manual_provenance(db):
+    from datetime import date
+    c = db.table("contacts").insert({"full_name": "Jill"}).execute().data[0]
+    r = runner.invoke(app, ["note", c["id"], "met at the summit"])
+    assert r.exit_code == 0, r.output
+    today = date.today().isoformat()
+    first_blob = f"[{today} rahul] met at the summit"
+    got = db.table("contacts").select("notes").eq("id", c["id"]).single().execute().data
+    assert got["notes"] == first_blob
+    rows = (db.table("enrichment_log")
+            .select("method,source,new_value,source_detail,is_current")
+            .eq("contact_id", c["id"]).eq("field", "notes").execute().data)
+    cur = [row for row in rows if row["is_current"]]
+    assert len(cur) == 1
+    assert cur[0]["method"] == "manual_set"
+    assert cur[0]["source"] == "rahul"
+    assert cur[0]["new_value"] == first_blob
+    assert cur[0]["source_detail"] == "met at the summit"
+
+    r2 = runner.invoke(app, ["note", c["id"], "followed up over email"])
+    assert r2.exit_code == 0, r2.output
+    second_blob = f"{first_blob}\n[{today} rahul] followed up over email"
+    got = db.table("contacts").select("notes").eq("id", c["id"]).single().execute().data
+    assert got["notes"] == second_blob
+    rows = (db.table("enrichment_log")
+            .select("new_value,source_detail,is_current")
+            .eq("contact_id", c["id"]).eq("field", "notes").execute().data)
+    cur = [row for row in rows if row["is_current"]]
+    assert len(cur) == 1
+    assert cur[0]["new_value"] == second_blob
+    assert cur[0]["source_detail"] == "followed up over email"
+    stale = [row for row in rows if not row["is_current"]]
+    assert [row["new_value"] for row in stale] == [first_blob]
+
+
+def test_note_wins_after_review_approve(db):
+    from datetime import date
+    c = db.table("contacts").insert({"full_name": "Kai"}).execute().data[0]
+    out = db.rpc("enrich_apply_candidate", {
+        "p_contact_id": c["id"], "p_field": "notes", "p_value": "Joined DeepCo as CTO",
+        "p_method": "enrich_api", "p_source": "pdl", "p_confidence": 0.5,
+        "p_source_detail": None, "p_dry_run": False}).execute().data
+    assert out == "review"
+    item = (db.table("enrich_review").select("id").eq("contact_id", c["id"])
+            .eq("field", "notes").eq("status", "open").execute().data)[0]
+    r = runner.invoke(app, ["enrich", "review", "--approve", item["id"]])
+    assert r.exit_code == 0, r.output
+    # a manual_set is_current row now sits on notes — the note must still win
+    r2 = runner.invoke(app, ["note", c["id"], "spoke at the offsite"])
+    assert r2.exit_code == 0, r2.output
+    today = date.today().isoformat()
+    expected = f"Joined DeepCo as CTO\n[{today} rahul] spoke at the offsite"
+    got = db.table("contacts").select("notes").eq("id", c["id"]).single().execute().data
+    assert got["notes"] == expected
+    cur = (db.table("enrichment_log").select("new_value,method")
+           .eq("contact_id", c["id"]).eq("field", "notes")
+           .eq("is_current", True).execute().data)
+    assert len(cur) == 1
+    assert cur[0]["new_value"] == expected
+    assert cur[0]["method"] == "manual_set"
+
+
+def test_note_manual_guard_routes_later_enrich_to_review(db):
+    c = db.table("contacts").insert({"full_name": "Lena"}).execute().data[0]
+    r = runner.invoke(app, ["note", c["id"], "intro'd by Sam at the AI dinner"])
+    assert r.exit_code == 0, r.output
+    blob = db.table("contacts").select("notes").eq("id", c["id"]).single().execute().data["notes"]
+    out = db.rpc("enrich_apply_candidate", {
+        "p_contact_id": c["id"], "p_field": "notes",
+        "p_value": "Now leads platform engineering at OrbitalWorks",
+        "p_method": "enrich_api", "p_source": "pdl", "p_confidence": 0.95,
+        "p_source_detail": '"leads platform engineering at OrbitalWorks since May 2026"',
+        "p_dry_run": False}).execute().data
+    assert out == "review"
+    got = db.table("contacts").select("notes").eq("id", c["id"]).single().execute().data
+    assert got["notes"] == blob
+
+
 # ----- Task 16: full dossier bundle -----
 
 def test_contact_dossier_bundle(db):
