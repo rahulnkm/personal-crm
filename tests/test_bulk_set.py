@@ -53,47 +53,45 @@ def test_bad_enum_value_exits_1(db):
 
 # ── happy path: writes + audit rows, chunked ──────────────────────────────────
 
-def test_happy_path_updates_and_logs_chunked(db):
-    """3 in_network contacts, CHUNK=2 → 2 read + 2 update + 2 insert calls,
-    all 3 get the new tier, 3 enrichment_log rows with method='bulk_set' and the
-    captured old_value."""
+def test_happy_path_survivorship_per_contact(db):
+    """3 in_network contacts → 3 per-contact enrich_apply_candidate calls (single
+    write discipline: no direct column update, no hand-rolled log insert), all 3
+    get the new tier, 3 elected manual_set provenance rows."""
     rows = [_seed(db, f"Bulk Set {i}", connection_status="in_network",
                   closeness_tier="none") for i in range(3)]
     ids = {r["id"] for r in rows}
 
     spy = CountingClient(db)
-    # bulk_set's read+update use .in_() (URL), so the loop chunks by URL_CHUNK.
-    # commands.bulk does `from crm.bulk import URL_CHUNK`, so patch the copy bound
-    # in commands.bulk (the one the loop reads).
     import crm.commands.bulk as bulk_cmd
     with patch("crm.commands.bulk.get_client", return_value=spy), \
-            patch.object(bulk_cmd, "URL_CHUNK", 2):
+            patch.object(bulk_cmd, "CHUNK", 2):  # slice boundary still exercised
         r = runner.invoke(app, ["bulk", "set", "closeness_tier=t2_dm",
                                 "--status", "in_network", "--yes", "--agent", "rahul"])
     assert r.exit_code == 0, r.output
 
-    # 3 ids at CHUNK=2 → two slices → two writes + two per-slice reads.
-    # _gate also resolves the cohort with one contacts.select("id"), so the
-    # contacts select count is the cohort read (1) + the two per-slice reads (2).
-    assert spy.count("contacts", "select") == 3
-    assert spy.count("contacts", "update") == 2
-    assert spy.count("enrichment_log", "insert") == 2
+    # one cohort read (_gate), one RPC per contact, zero direct writes
+    assert spy.count("contacts", "select") == 1
+    assert spy.rpc_count("enrich_apply_candidate") == 3
+    assert spy.count("contacts", "update") == 0
+    assert spy.count("enrichment_log", "insert") == 0
 
-    # all three updated
+    # all three updated (materialized by the RPC's recompute)
     updated = db.table("contacts").select("id,closeness_tier").in_("id", list(ids)).execute().data
     assert all(u["closeness_tier"] == "t2_dm" for u in updated)
 
-    # 3 audit rows, captured old_value
+    # 3 provenance rows, elected, manual_set; old_value is NULL because no prior
+    # provenance row existed (the RPC snapshots the previous elected row, not the column)
     logs = db.table("enrichment_log").select(
-        "contact_id,field,old_value,new_value,source,method"
-    ).eq("method", "bulk_set").execute().data
+        "contact_id,field,old_value,new_value,source,method,is_current"
+    ).eq("method", "manual_set").execute().data
     assert len(logs) == 3
     assert {lg["contact_id"] for lg in logs} == ids
     for lg in logs:
         assert lg["field"] == "closeness_tier"
-        assert lg["old_value"] == "none"
+        assert lg["old_value"] is None
         assert lg["new_value"] == "t2_dm"
         assert lg["source"] == "rahul"
+        assert lg["is_current"] is True
 
 
 # ── JSON shape ────────────────────────────────────────────────────────────────
@@ -124,7 +122,7 @@ def test_dry_run_no_writes(db):
     # nothing written
     after = db.table("contacts").select("closeness_tier").eq("id", c["id"]).single().execute().data
     assert after["closeness_tier"] == "none"
-    assert db.table("enrichment_log").select("id").eq("method", "bulk_set").execute().data == []
+    assert db.table("enrichment_log").select("id").execute().data == []
 
 
 # ── write without --yes is refused ────────────────────────────────────────────

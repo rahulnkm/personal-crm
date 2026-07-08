@@ -10,7 +10,7 @@ from datetime import date as date_t
 
 import typer
 
-from crm.bulk import CHUNK, URL_CHUNK, _emit, _gate
+from crm.bulk import CHUNK, _emit, _gate
 from crm.commands.contacts import ARRAY_FIELDS, ENUM_VALUES, SETTABLE
 from crm.commands.log import VALID_KINDS, _bump_last_touchpoint_bulk, _validate_iso_date
 from crm.config import get_client
@@ -56,22 +56,21 @@ def bulk_set(
     if ids is None:  # gate already emitted (dry-run preview / empty cohort) or raised
         return
 
-    # bulk_set's read + update use .in_("id", ...) which travels in the URL, so
-    # chunk by URL_CHUNK (not CHUNK) to stay under the URL-length ceiling.
-    for i in range(0, len(ids), URL_CHUNK):
-        chunk = ids[i:i + URL_CHUNK]
-        # capture pre-write values so the audit log records the real old_value
-        before = (client.table("contacts").select("id," + field)
-                  .in_("id", chunk).execute().data)
-        old = {r["id"]: r.get(field) for r in before}
-        (client.table("contacts")
-         .update({field: value, "updated_at": "now()"})
-         .in_("id", chunk).execute())
-        client.table("enrichment_log").insert(
-            [{"contact_id": cid, "field": field, "old_value": str(old.get(cid)),
-              "new_value": str(value), "source": agent, "method": "bulk_set"}
-             for cid in chunk]
-        ).execute()
+    # Single write discipline: route every contact through the survivorship RPC
+    # (manual_set) so the elected provenance row always matches the column — a
+    # direct update + hand-rolled log row leaves the old is_current row elected,
+    # and a later enrich_recompute_field would resurrect the old value.
+    # Per-contact calls, CHUNK-sliced like _bump_last_touchpoint_bulk; cohorts
+    # are hundreds at most, so correctness beats the round-trip savings.
+    # Blank value (`field=`) is a deliberate NULL clear, matching single crm set.
+    p_value = value if value != "" else None
+    for i in range(0, len(ids), CHUNK):
+        for cid in ids[i:i + CHUNK]:
+            client.rpc("enrich_apply_candidate", {
+                "p_contact_id": cid, "p_field": field, "p_value": p_value,
+                "p_method": "manual_set", "p_source": agent, "p_confidence": 1.0,
+                "p_source_detail": None, "p_dry_run": False,
+            }).execute()
 
     # changed == cohort for set (every matched row is written)
     _emit(ids, len(ids), dry_run=False, as_json=as_json)
