@@ -50,6 +50,9 @@ class EnrichCandidate:
 
 # narrative fields whose claims must carry a grounding span in source_detail
 NARRATIVE_FIELDS = {"origin_context", "notes"}
+# per-field rejection outcomes emitted into apply's JSON result
+REJECTED_UNGROUNDED = "rejected_ungrounded"
+REJECTED_BAD_FACET = "rejected_bad_facet"
 # minimum source_detail length for narrative/expertise writes. Length+presence
 # only — a >=20-char pointer still passes; span-ness isn't machine-checkable here.
 MIN_SOURCE_DETAIL_LEN = 20
@@ -66,24 +69,26 @@ _SPAN_ERR = (
 def gate_candidate(cand: EnrichCandidate) -> tuple[str, str] | None:
     """Pre-write check for narrative/expertise candidates.
 
-    Returns (outcome, error) — 'rejected_bad_facet' or 'rejected_ungrounded' —
-    or None if the candidate may proceed to the RPCs. Other fields pass untouched.
+    Returns (outcome, error) — REJECTED_BAD_FACET or REJECTED_UNGROUNDED — or
+    None if the candidate may proceed to the RPCs. Other fields pass untouched.
+    Facet shape is checked first: a candidate failing both checks gets only
+    REJECTED_BAD_FACET.
     """
     if cand.field == "expertise":
         v = (cand.value or "").strip()
         if v.startswith("["):
-            return ("rejected_bad_facet",
+            return (REJECTED_BAD_FACET,
                     "expertise element looks like a stringified JSON array "
                     f"({v[:40]!r}) — send one facet per candidate, not the array "
                     "serialized into a single element")
         if not EXPERTISE_FACET_RE.match(v):
-            return ("rejected_bad_facet",
+            return (REJECTED_BAD_FACET,
                     f"expertise element {v!r} must match "
-                    "^(tool|skill|role|domain):[a-z0-9-]+$ (lowercase kebab slug)")
+                    f"{EXPERTISE_FACET_RE.pattern} (lowercase kebab slug)")
     if cand.field in NARRATIVE_FIELDS or cand.field == "expertise":
         detail = (cand.source_detail or "").strip()
         if len(detail) < MIN_SOURCE_DETAIL_LEN:
-            return ("rejected_ungrounded", f"{cand.field} {_SPAN_ERR}")
+            return (REJECTED_UNGROUNDED, f"{cand.field} {_SPAN_ERR}")
     return None
 
 
@@ -108,7 +113,8 @@ def _one(obj: dict) -> EnrichCandidate:
     source_detail = obj.get("source_detail")
     evidence = obj.get("evidence")
     # fold evidence into source_detail so provenance carries both the URL and the
-    # human-readable justification in one column
+    # human-readable justification in one column. NOTE: the folded value is what
+    # gate_candidate sees — a >=20-char evidence alone satisfies the span check.
     if source_detail and evidence:
         source_detail = f"{source_detail} · {evidence}"
     elif evidence and not source_detail:

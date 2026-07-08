@@ -12,6 +12,8 @@ from crm.cli import app
 from crm.enrich import (
     EXPERTISE_FACET_RE,
     MIN_SOURCE_DETAIL_LEN,
+    REJECTED_BAD_FACET,
+    REJECTED_UNGROUNDED,
     gate_candidate,
     parse_payload,
 )
@@ -39,7 +41,7 @@ def test_spanless_origin_context_rejected_and_not_written(db):
     c = db.table("contacts").insert({"full_name": "Gate A"}).execute().data[0]
     out = _apply(db, c["id"], [{"field": "origin_context", "value": "met at a hackathon",
                                 "confidence": 0.9, "source": "agent:claude-web"}])
-    assert out[0]["outcome"] == "rejected_ungrounded"
+    assert out[0]["outcome"] == REJECTED_UNGROUNDED
     assert db.table("contacts").select("origin_context").eq("id", c["id"]).single().execute().data["origin_context"] is None
     assert db.table("enrichment_log").select("id").eq("contact_id", c["id"]).eq("field", "origin_context").execute().data == []
 
@@ -53,11 +55,11 @@ def test_source_detail_length_threshold(db):
     out = _apply(db, c["id"], [{"field": "origin_context", "value": "met somewhere",
                                 "confidence": 0.9, "source": "agent:claude-web",
                                 "source_detail": "x" * 19}])
-    assert out[0]["outcome"] == "rejected_ungrounded"
+    assert out[0]["outcome"] == REJECTED_UNGROUNDED
     out = _apply(db, c["id"], [{"field": "origin_context", "value": "met somewhere",
                                 "confidence": 0.9, "source": "agent:claude-web",
                                 "source_detail": "x" * 20}])
-    assert out[0]["outcome"] != "rejected_ungrounded"
+    assert out[0]["outcome"] != REJECTED_UNGROUNDED
     assert db.table("contacts").select("origin_context").eq("id", c["id"]).single().execute().data["origin_context"] == "met somewhere"
 
 
@@ -72,7 +74,17 @@ def test_pointer_style_detail_over_threshold_still_accepted(db):
     out = _apply(db, c["id"], [{"field": "notes", "value": "long-time collaborator",
                                 "confidence": 0.9, "source": "agent:claude-web",
                                 "source_detail": "iMessage +17325550101, 2021-2023"}])
-    assert out[0]["outcome"] not in ("rejected_ungrounded", "rejected_bad_facet")
+    assert out[0]["outcome"] not in (REJECTED_UNGROUNDED, REJECTED_BAD_FACET)
+
+
+def test_evidence_fold_satisfies_span_check():
+    # LIMIT (pinned): parse_payload folds `evidence` into source_detail BEFORE the
+    # gate runs, so a >=20-char evidence alone (a justification, not a quoted span)
+    # passes the ungrounded check. Explicit, not accidental.
+    cand = parse_payload(
+        '{"field":"origin_context","value":"met at x","source":"a",'
+        '"evidence":"profile bio mentions the hackathon"}')[0]
+    assert gate_candidate(cand) is None
 
 
 # ----- (d) stringified-JSON-array expertise → rejected_bad_facet naming the bug -----
@@ -83,7 +95,7 @@ def test_expertise_stringified_array_rejected_with_named_bug(db):
     out = _apply(db, c["id"], [{"field": "expertise", "value": '["role:founder","domain:ai"]',
                                 "confidence": 0.9, "source": "agent:claude-web",
                                 "source_detail": SPAN}])
-    assert out[0]["outcome"] == "rejected_bad_facet"
+    assert out[0]["outcome"] == REJECTED_BAD_FACET
     assert "array" in out[0]["error"].lower()  # names the stringified-JSON-array bug
     assert db.table("contacts").select("expertise").eq("id", c["id"]).single().execute().data["expertise"] in (None, [])
 
@@ -96,7 +108,7 @@ def test_expertise_facet_shape(db):
     out = _apply(db, c["id"], [{"field": "expertise", "value": "skill:RF circuit design",
                                 "confidence": 0.9, "source": "agent:claude-web",
                                 "source_detail": SPAN}])
-    assert out[0]["outcome"] == "rejected_bad_facet"
+    assert out[0]["outcome"] == REJECTED_BAD_FACET
     out = _apply(db, c["id"], [{"field": "expertise", "value": "skill:rf-circuit-design",
                                 "confidence": 0.9, "source": "agent:claude-web",
                                 "source_detail": SPAN}])
@@ -115,7 +127,7 @@ def test_mixed_payload_scalar_applies_narrative_rejected(db):
         {"field": "current_company", "value": "OrbitalWorks", "confidence": 0.9, "source": "agent:claude-web"},
     ])
     by_field = {r["field"]: r for r in out}
-    assert by_field["notes"]["outcome"] == "rejected_ungrounded"
+    assert by_field["notes"]["outcome"] == REJECTED_UNGROUNDED
     assert by_field["current_company"]["outcome"] == "golden"
     assert db.table("contacts").select("current_company").eq("id", c["id"]).single().execute().data["current_company"] == "OrbitalWorks"
 
@@ -145,7 +157,7 @@ def test_grounded_payload_unchanged_end_to_end(db):
 def test_gate_error_text_teaches_span_vs_pointer():
     cand = parse_payload('{"field":"origin_context","value":"met at x","source":"a"}')[0]
     outcome, msg = gate_candidate(cand)
-    assert outcome == "rejected_ungrounded"
+    assert outcome == REJECTED_UNGROUNDED
     assert "phone number + date range is not a span" in msg
 
 
