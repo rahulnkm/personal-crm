@@ -1,16 +1,26 @@
 """Guard rail: no new direct writes to the contacts table.
 
-Every ``.table("contacts").update(...)`` / ``.insert(...)`` in src/crm must sit
-at an allowlisted site. Everything else goes through the survivorship RPCs (so
-provenance is logged) — see
+Every ``.table("contacts").update(...)`` / ``.insert(...)`` / ``.upsert(...)``
+in src/crm must sit at an allowlisted site. Everything else goes through the
+survivorship RPCs (so provenance is logged) — see
 docs/superpowers/plans/2026-07-07-provenance-write-path-consolidation.md.
 
 Matcher choice: we parse each file with ``ast`` and walk call chains, rather
 than grepping the source text. A textual grep — even one that whitespace-
-normalizes — is evadable (comments inside a method chain, aliasing) and can't
-tell you *which function* wrote. The AST sees the chain regardless of how it's
+normalizes — is evadable (comments inside a method chain) and can't tell you
+*which function* wrote. The AST sees the chain regardless of how it's
 formatted, and anchors each hit to its enclosing function, so the allowlist
 pins (file, function, kind, count) instead of brittle line numbers.
+
+Known blind spots (stated so the guard isn't over-trusted):
+  - two-statement aliasing breaks the chain the walker follows:
+    ``t = client.table("contacts"); t.update(...)`` is NOT caught;
+  - non-literal table names are NOT caught: ``.table(TABLE)`` or
+    ``.table(name="contacts")`` don't match the literal-"contacts" check;
+  - ``.delete(`` is not guarded (deletes carry no fact provenance; out of
+    the plan's scope);
+  - the allowlist keys on function NAME, not qualified path — two same-named
+    functions in one file would merge their counts into one entry.
 """
 import ast
 from pathlib import Path
@@ -18,7 +28,7 @@ from pathlib import Path
 SRC = Path(__file__).resolve().parent.parent / "src" / "crm"
 PLAN = "docs/superpowers/plans/2026-07-07-provenance-write-path-consolidation.md"
 
-# (file relative to src/crm, enclosing function, update|insert) -> expected count.
+# (file relative to src/crm, enclosing function, update|insert|upsert) -> expected count.
 # Each entry needs a justification; anything not here fails the guard.
 ALLOWLIST = {
     # dedup fill: value written after survivorship-equivalent gating, logged
@@ -78,7 +88,7 @@ def _chain_touches_contacts(node: ast.Call) -> bool:
 
 
 def _contact_writes(source: str):
-    """Yield (enclosing function name, 'update'|'insert', lineno) per write."""
+    """Yield (enclosing function name, write kind, lineno) per write."""
     tree = ast.parse(source)
     # map every node to its innermost enclosing function
     parents = {}
@@ -89,7 +99,7 @@ def _contact_writes(source: str):
         if (
             isinstance(node, ast.Call)
             and isinstance(node.func, ast.Attribute)
-            and node.func.attr in ("update", "insert")
+            and node.func.attr in ("update", "insert", "upsert")
             and _chain_touches_contacts(node)
         ):
             fn, cur = "<module>", node
@@ -107,8 +117,10 @@ def test_matcher_defeats_line_break_evasion():
     must still match."""
     split = 'def f(c):\n    (c.table("contacts")\n     .update({"x": 1})\n     .eq("id", i).execute())\n'
     commented = 'def g(c):\n    (c.table("contacts")  # sneaky\n     .insert({"x": 1}).execute())\n'
+    upsert = 'def h(c):\n    (c.table("contacts")\n     .upsert({"x": 1}).execute())\n'
     assert list(_contact_writes(split)) == [("f", "update", 2)]
     assert list(_contact_writes(commented)) == [("g", "insert", 2)]
+    assert list(_contact_writes(upsert)) == [("h", "upsert", 2)]
 
 
 def test_note_is_not_allowlisted():
