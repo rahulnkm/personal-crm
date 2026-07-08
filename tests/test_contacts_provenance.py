@@ -155,6 +155,89 @@ def test_note_manual_guard_routes_later_enrich_to_review(db):
     assert got["notes"] == blob
 
 
+# ----- birth provenance: newly created contacts log their birth field values -----
+
+def test_dedup_bulk_create_writes_birth_provenance(db):
+    # no match anywhere -> bulk create path (create_contacts_with_identities RPC)
+    db.table("staging").insert(
+        {"source": "s1", "source_external_id": "x1", "full_name": "Ada Lovelace",
+         "role": "Mathematician", "company": "Analytical", "location": "London",
+         "twitter_username": "adalovelace", "github_username": "ada-lovelace",
+         "website_url": "https://ada.example.com", "match_status": "pending"}
+    ).execute()
+    r = runner.invoke(app, ["dedup"])
+    assert r.exit_code == 0, r.output
+    cid = db.table("contacts").select("id").execute().data[0]["id"]
+    rows = (db.table("enrichment_log").select("*")
+            .eq("contact_id", cid).eq("method", "import_create").execute().data)
+    by_field = {row["field"]: row for row in rows}
+    assert set(by_field) == {"full_name", "current_role", "current_company",
+                             "location", "twitter_username", "github_username",
+                             "website_url"}
+    assert by_field["full_name"]["new_value"] == "Ada Lovelace"
+    assert by_field["twitter_username"]["new_value"] == "adalovelace"  # W2 social rides along
+    assert by_field["website_url"]["new_value"] == "https://ada.example.com"
+    for row in rows:
+        assert row["source"] == "s1"
+        assert row["source_detail"] == "staging s1/x1"
+        assert row["is_current"] is True
+
+
+def test_dedup_bulk_create_skips_null_birth_fields(db):
+    db.table("staging").insert(
+        {"source": "s1", "source_external_id": "x2", "full_name": "Grace Hopper",
+         "company": "Navy", "match_status": "pending"}).execute()
+    r = runner.invoke(app, ["dedup"])
+    assert r.exit_code == 0, r.output
+    rows = (db.table("enrichment_log").select("field")
+            .eq("method", "import_create").execute().data)
+    assert {row["field"] for row in rows} == {"full_name", "current_company"}
+
+
+def test_review_reject_create_writes_birth_provenance(db):
+    from crm.commands.dedup import _create
+    staged = db.table("staging").insert(
+        {"source": "s3", "source_external_id": "h3", "full_name": "Ada Lovelace",
+         "role": "Countess", "twitter_username": "adalovelace"}).execute().data[0]
+    cid = _create(db, staged)
+    rows = (db.table("enrichment_log").select("*")
+            .eq("contact_id", cid).eq("method", "import_create").execute().data)
+    by_field = {row["field"]: row for row in rows}
+    assert set(by_field) == {"full_name", "current_role", "twitter_username"}
+    assert by_field["current_role"]["new_value"] == "Countess"
+    for row in rows:
+        assert row["source"] == "s3"
+        assert row["source_detail"] == "staging s3/h3"
+        assert row["is_current"] is True
+
+
+def test_add_writes_manual_add_provenance(db):
+    r = runner.invoke(app, ["add", "Zed Zebra", "--role", "Engineer",
+                            "--company", "ZCo", "--origin", "met at the summit"])
+    assert r.exit_code == 0, r.output
+    cid = r.stdout.strip().splitlines()[-1]
+    rows = (db.table("enrichment_log").select("*")
+            .eq("contact_id", cid).eq("method", "manual_add").execute().data)
+    by_field = {row["field"]: row for row in rows}
+    assert set(by_field) == {"full_name", "current_role", "current_company",
+                             "origin_context"}
+    assert by_field["full_name"]["new_value"] == "Zed Zebra"
+    assert by_field["origin_context"]["new_value"] == "met at the summit"
+    for row in rows:
+        assert row["source"] == "rahul"
+        assert row["source_detail"] is None   # manual ground truth: no span
+        assert row["is_current"] is True
+
+
+def test_add_skips_null_birth_fields(db):
+    r = runner.invoke(app, ["add", "Solo Name"])
+    assert r.exit_code == 0, r.output
+    cid = r.stdout.strip().splitlines()[-1]
+    rows = (db.table("enrichment_log").select("field")
+            .eq("contact_id", cid).eq("method", "manual_add").execute().data)
+    assert [row["field"] for row in rows] == ["full_name"]
+
+
 # ----- Task 16: full dossier bundle -----
 
 def test_contact_dossier_bundle(db):

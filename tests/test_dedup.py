@@ -36,9 +36,12 @@ def test_dedup_attaches_exact_match_and_fills_nulls(db):
     assert contacts[0]["current_company"] == "Analytical Engines"  # null filled
     assert contacts[0]["full_name"] == "Ada Lovelace"        # existing value survives
     assert len(db.table("contact_identities").select("id").execute().data) == 2
-    # conflict was logged, not silently dropped
-    log = db.table("enrichment_log").select("*").eq("field", "full_name").execute().data
-    assert log and log[0]["new_value"] == "Ada K. Lovelace"
+    # conflict was logged, not silently dropped (the s1 birth row also carries
+    # full_name — filter to the conflict method)
+    log = (db.table("enrichment_log").select("*").eq("field", "full_name")
+           .eq("method", "import_conflict").execute().data)
+    assert len(log) == 1
+    assert log[0]["new_value"] == "Ada K. Lovelace"
 
 
 def test_dedup_queues_ambiguous_for_review(db):

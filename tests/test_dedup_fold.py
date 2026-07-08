@@ -102,6 +102,7 @@ def test_fold_cross_item_fill_earlier_wins_later_logs_against_accumulator():
     assert c["new_value"] == "SecondCo"
     assert c["method"] == "import_conflict"
     assert c["source"] == "srcB"           # later item's source
+    assert c["source_detail"] == "staging srcB/e2"  # points at the losing staging row
 
 
 def test_fold_same_contact_existing_identity_no_reinsert_still_fills():
@@ -153,6 +154,7 @@ def test_fold_full_name_conflict_logged():
     assert name_logs[0]["old_value"] == "Ada Lovelace"
     assert name_logs[0]["new_value"] == "Ada K. Lovelace"
     assert name_logs[0]["method"] == "import_conflict"
+    assert name_logs[0]["source_detail"] == "staging s/e1"
 
 
 def test_fold_deref_create_key_before_contact_lookup():

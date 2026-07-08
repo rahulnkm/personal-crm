@@ -183,9 +183,10 @@ def test_dedup_fold_logs_import_fill(db, tmp_path):
     assert f["is_current"] is True
     conflicts = (db.table("enrichment_log").select("*")
                  .eq("method", "import_conflict").execute().data)
-    assert [(c["field"], c["old_value"], c["new_value"], c["is_current"])
-            for c in conflicts] == \
-        [("current_company", "Analytical", "Difference Engine Co", False)]
+    assert [(c["field"], c["old_value"], c["new_value"], c["is_current"],
+             c["source_detail"]) for c in conflicts] == \
+        [("current_company", "Analytical", "Difference Engine Co", False,
+          f"staging s2/{sxid}")]
 
 
 def test_dedup_fold_respects_manual_clear(db, tmp_path):
@@ -214,6 +215,9 @@ def test_dedup_fold_respects_manual_clear(db, tmp_path):
     assert conflicts[0]["old_value"] is None
     assert conflicts[0]["new_value"] == "CEO"
     assert conflicts[0]["is_current"] is False
+    sxid2 = db.table("staging").select("source_external_id").eq(
+        "source", "s2").execute().data[0]["source_external_id"]
+    assert conflicts[0]["source_detail"] == f"staging s2/{sxid2}"
     fills = (db.table("enrichment_log").select("id")
              .eq("method", "import_fill").eq("field", "current_role").execute().data)
     assert fills == []
@@ -249,9 +253,11 @@ def test_fill_and_log_single_attach(db):
     assert conflicts["current_role"]["old_value"] is None
     assert conflicts["current_role"]["new_value"] == "CEO"
     assert conflicts["current_role"]["is_current"] is False
+    assert conflicts["current_role"]["source_detail"] == "staging s9/h9"
     assert conflicts["current_company"]["old_value"] == "Analytical"
     assert conflicts["current_company"]["new_value"] == "Difference Engine Co"
     assert conflicts["current_company"]["is_current"] is False
+    assert conflicts["current_company"]["source_detail"] == "staging s9/h9"
 
 
 def test_review_reject_create_carries_socials(db):

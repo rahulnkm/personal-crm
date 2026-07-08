@@ -291,9 +291,17 @@ def add(
         client.table("contact_identities").insert(
             {"contact_id": c["id"], "source": f"agent:{agent}", "email": email}
         ).execute()
+        # birth provenance — one batched insert; manual ground truth needs no span,
+        # so source_detail stays NULL (never empty: full_name is required)
+        client.table("enrichment_log").insert(
+            [{"contact_id": c["id"], "field": f, "new_value": v, "source": agent,
+              "method": "manual_add", "is_current": True}
+             for f, v in (("full_name", full_name), ("current_role", role),
+                          ("current_company", company), ("origin_context", origin))
+             if v]).execute()
     except Exception as exc:
         # roll back the just-created orphan so a half-completed add never reports
-        # success — the contact has no other references yet, so deleting it is safe
+        # success — identities/log rows cascade with the contact delete
         try:
             client.table("contacts").delete().eq("id", c["id"]).execute()
             rolled = f"rolled back contact {c['id']}"

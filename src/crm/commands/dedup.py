@@ -43,12 +43,24 @@ def _fill_row(contact_id, field, value, source, source_external_id):
             "is_current": True}
 
 
-def _conflict_row(contact_id, field, old, new, source):
+def _conflict_row(contact_id, field, old, new, source, source_external_id):
     """Rejected value — pinned is_current=false (electing it would both lie and
-    collide with the partial unique index on elected rows)."""
+    collide with the partial unique index on elected rows). Carries the staging
+    pointer so N same-cluster conflicts on one field stay distinguishable."""
     return {"contact_id": contact_id, "field": field, "old_value": old,
             "new_value": new, "source": source, "method": "import_conflict",
+            "source_detail": f"staging {source}/{source_external_id}",
             "is_current": False}
+
+
+def _birth_rows(contact_id, fields, source, source_external_id):
+    """import_create rows for a brand-new contact's non-null birth values — elected
+    (is_current): the contact has no prior rows, so no elected-index collision."""
+    return [{"contact_id": contact_id, "field": f, "new_value": v,
+             "source": source, "method": "import_create",
+             "source_detail": f"staging {source}/{source_external_id}",
+             "is_current": True}
+            for f, v in fields.items() if v]
 
 
 def _elected_pairs(client, contact_ids):
@@ -73,15 +85,15 @@ def _fill_and_log(client, contact_id, staged, source):
             continue
         if not contact.get(cf):
             if (contact_id, cf) in elected:              # deliberate clear wins
-                log_rows.append(_conflict_row(contact_id, cf, None, new, source))
+                log_rows.append(_conflict_row(contact_id, cf, None, new, source, sxid))
             else:
                 updates[cf] = new
                 log_rows.append(_fill_row(contact_id, cf, new, source, sxid))
         elif contact[cf] != new:
-            log_rows.append(_conflict_row(contact_id, cf, contact[cf], new, source))
+            log_rows.append(_conflict_row(contact_id, cf, contact[cf], new, source, sxid))
     if staged.get("full_name") and staged["full_name"] != contact["full_name"]:
-        log_rows.append(_conflict_row(contact_id, "full_name",
-                                      contact["full_name"], staged["full_name"], source))
+        log_rows.append(_conflict_row(contact_id, "full_name", contact["full_name"],
+                                      staged["full_name"], source, sxid))
     if updates:
         updates["updated_at"] = "now()"
         client.table("contacts").update(updates).eq("id", contact_id).execute()
@@ -154,17 +166,20 @@ def _fold_auto(auto, deref, contact_by_id, existing, elected):
                 continue
             if not acc[cid].get(cf):
                 if (cid, cf) in elected:             # deliberate clear wins
-                    enrich_rows.append(_conflict_row(cid, cf, None, new, it["source"]))
+                    enrich_rows.append(_conflict_row(cid, cf, None, new, it["source"],
+                                                     it["source_external_id"]))
                     continue
                 fills.setdefault(cid, {})[cf] = new
                 acc[cid][cf] = new                   # WRITE BACK
                 enrich_rows.append(_fill_row(cid, cf, new, it["source"],
                                              it["source_external_id"]))
             elif acc[cid][cf] != new:
-                enrich_rows.append(_conflict_row(cid, cf, acc[cid][cf], new, it["source"]))
+                enrich_rows.append(_conflict_row(cid, cf, acc[cid][cf], new, it["source"],
+                                                 it["source_external_id"]))
         if staged.get("full_name") and staged["full_name"] != acc[cid].get("full_name"):
             enrich_rows.append(_conflict_row(cid, "full_name", acc[cid].get("full_name"),
-                                             staged["full_name"], it["source"]))
+                                             staged["full_name"], it["source"],
+                                             it["source_external_id"]))
         outcomes[it["id"]] = "attached"
     return id_inserts, enrich_rows, fills, outcomes
 
@@ -179,6 +194,13 @@ def _execute_cluster(client, items, state, lock):
         for row in (client.rpc("create_contacts_with_identities",
                     {"payload": payload}).execute().data):
             keymap[row["create_key"]] = row["contact_id"]
+
+    # birth provenance for the just-created contacts — merged into the cluster's
+    # single enrichment_log insert below (no per-contact writes)
+    birth_rows = []
+    for it in creates:
+        birth_rows += _birth_rows(keymap[it["create_key"]], it["contact_fields"],
+                                  it["source"], it["source_external_id"])
 
     def deref(ref):
         return keymap.get(ref, ref)
@@ -207,8 +229,8 @@ def _execute_cluster(client, items, state, lock):
         # unique index on (source, source_external_id), and ON CONFLICT DO NOTHING
         # guarantees a duplicate/pre-existing identity never aborts the batch.
         client.rpc("bulk_insert_identities", {"payload": id_inserts}).execute()
-    if enrich_rows:
-        client.table("enrichment_log").insert(enrich_rows).execute()
+    if birth_rows or enrich_rows:
+        client.table("enrichment_log").insert(birth_rows + enrich_rows).execute()
     for cid, upd in fills.items():
         client.table("contacts").update({**upd, "updated_at": "now()"}).eq("id", cid).execute()
 
@@ -271,19 +293,22 @@ def _attach(client, staged: dict, contact_id: str) -> bool:
 
 
 def _create(client, staged: dict) -> str:
-    contact = client.table("contacts").insert(
-        {"full_name": staged["full_name"],
-         "current_role": staged.get("role"),
-         "current_company": staged.get("company"),
-         "location": staged.get("location"),
-         "twitter_username": staged.get("twitter_username"),
-         "github_username": staged.get("github_username"),
-         "website_url": staged.get("website_url")}
-    ).execute().data[0]
+    fields = {"full_name": staged["full_name"],
+              "current_role": staged.get("role"),
+              "current_company": staged.get("company"),
+              "location": staged.get("location"),
+              "twitter_username": staged.get("twitter_username"),
+              "github_username": staged.get("github_username"),
+              "website_url": staged.get("website_url")}
+    contact = client.table("contacts").insert(fields).execute().data[0]
     client.table("contact_identities").insert(
         {"contact_id": contact["id"],
          **{f: staged.get(f) for f in IDENTITY_FIELDS}}
     ).execute()
+    # birth provenance — one batched insert (never empty: full_name is required)
+    client.table("enrichment_log").insert(
+        _birth_rows(contact["id"], fields, staged["source"],
+                    staged.get("source_external_id"))).execute()
     return contact["id"]
 
 
