@@ -57,6 +57,15 @@ def test_no_banned_phrases(path, cmd):
     assert not hit, f"{'.'.join(path)} still contains banned phrasing: {hit}"
 
 
+def test_enrich_apply_documents_gate_outcomes():
+    """enrich apply's help must name both gate rejection labels (presence,
+    not prose — agents key on the literal outcome strings)."""
+    apply_cmd = CLICK_APP.commands["enrich"].commands["apply"]
+    text = _help_text(apply_cmd)
+    for label in ("rejected_ungrounded", "rejected_bad_facet"):
+        assert label in text, f"enrich apply --help no longer documents {label}"
+
+
 def test_agent_and_json_help_are_reused_strings():
     """The systemic --agent / --json help must be the single shared phrasing."""
     from crm.output import AGENT_HELP, JSON_HELP
