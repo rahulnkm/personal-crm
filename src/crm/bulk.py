@@ -2,11 +2,9 @@
 
 `CHUNK` bounds body-carried write batches (RPC `jsonb`/array payloads and
 `.insert([...])` bodies — these travel in the request body, so 500 is safe).
-`URL_CHUNK` bounds `.in_("id", ...)` filters that travel in the request URL —
-matching backfill's vetted ceiling (100 ids ≈ 4 KB) so a large cohort can't blow
-the URL length. `PAGE` bounds cohort-read pagination. All are module constants so
-tests can monkeypatch them small for fast boundary coverage; `PAGE`/`URL_CHUNK`
-here are independent of `backfill.PAGE`.
+`PAGE` bounds cohort-read pagination. Both are module constants so tests can
+monkeypatch them small for fast boundary coverage; `PAGE` here is independent
+of `backfill.PAGE`.
 """
 import json
 from datetime import date, timedelta
@@ -14,7 +12,6 @@ from datetime import date, timedelta
 import typer
 
 CHUNK = 500
-URL_CHUNK = 100
 PAGE = 1000
 
 

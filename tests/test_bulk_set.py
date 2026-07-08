@@ -62,9 +62,7 @@ def test_happy_path_survivorship_per_contact(db):
     ids = {r["id"] for r in rows}
 
     spy = CountingClient(db)
-    import crm.commands.bulk as bulk_cmd
-    with patch("crm.commands.bulk.get_client", return_value=spy), \
-            patch.object(bulk_cmd, "CHUNK", 2):  # slice boundary still exercised
+    with patch("crm.commands.bulk.get_client", return_value=spy):
         r = runner.invoke(app, ["bulk", "set", "closeness_tier=t2_dm",
                                 "--status", "in_network", "--yes", "--agent", "rahul"])
     assert r.exit_code == 0, r.output

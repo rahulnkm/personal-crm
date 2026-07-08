@@ -60,17 +60,18 @@ def bulk_set(
     # (manual_set) so the elected provenance row always matches the column — a
     # direct update + hand-rolled log row leaves the old is_current row elected,
     # and a later enrich_recompute_field would resurrect the old value.
-    # Per-contact calls, CHUNK-sliced like _bump_last_touchpoint_bulk; cohorts
-    # are hundreds at most, so correctness beats the round-trip savings.
+    # Per-contact calls (the RPC takes one id, so nothing batches); cohorts are
+    # hundreds at most, so correctness beats the round-trip savings.
     # Blank value (`field=`) is a deliberate NULL clear, matching single crm set.
+    # Mid-loop error aborts (matches bulk tag/log); rerun is idempotent —
+    # manual_set just overwrites.
     p_value = value if value != "" else None
-    for i in range(0, len(ids), CHUNK):
-        for cid in ids[i:i + CHUNK]:
-            client.rpc("enrich_apply_candidate", {
-                "p_contact_id": cid, "p_field": field, "p_value": p_value,
-                "p_method": "manual_set", "p_source": agent, "p_confidence": 1.0,
-                "p_source_detail": None, "p_dry_run": False,
-            }).execute()
+    for cid in ids:
+        client.rpc("enrich_apply_candidate", {
+            "p_contact_id": cid, "p_field": field, "p_value": p_value,
+            "p_method": "manual_set", "p_source": agent, "p_confidence": 1.0,
+            "p_source_detail": None, "p_dry_run": False,
+        }).execute()
 
     # changed == cohort for set (every matched row is written)
     _emit(ids, len(ids), dry_run=False, as_json=as_json)
