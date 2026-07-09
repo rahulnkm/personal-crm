@@ -6,6 +6,7 @@ Rejection is per-field (outcome in the JSON result), never a hard exit.
 """
 import json
 
+import pytest
 from typer.testing import CliRunner
 
 from crm.cli import app
@@ -159,6 +160,16 @@ def test_gate_error_text_teaches_span_vs_pointer():
     outcome, msg = gate_candidate(cand)
     assert outcome == REJECTED_UNGROUNDED
     assert "phone number + date range is not a span" in msg
+
+
+def test_list_valued_candidate_rejected_at_parse():
+    # Agents naturally emit the whole expertise array as one candidate's `value`.
+    # That must fail cleanly at parse (teaching one-facet-per-candidate), not crash
+    # later in gate_candidate with 'list' object has no attribute 'strip'.
+    with pytest.raises(ValueError, match="one facet per candidate"):
+        parse_payload(
+            '[{"field":"expertise","value":["skill:zk","tool:circom"],'
+            '"source":"a","source_detail":"her msg 2021-03-14: pushed the circom circuits"}]')
 
 
 def test_expertise_regex_boundaries():

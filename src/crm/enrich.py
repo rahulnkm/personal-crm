@@ -99,6 +99,12 @@ def _one(obj: dict) -> EnrichCandidate:
     if not field:
         raise ValueError("Candidate missing required 'field'")
     field = FIELD_ALIASES.get(field, field)
+    value = obj.get("value")
+    if value is not None and not isinstance(value, str):
+        raise ValueError(
+            f"'{field}' value must be a string, got {type(value).__name__} "
+            f"({value!r:.40}) — send one facet per candidate, not the array as a "
+            "single value")
     conf = obj.get("confidence")
     if conf is not None:
         conf = float(conf)
@@ -122,7 +128,7 @@ def _one(obj: dict) -> EnrichCandidate:
 
     return EnrichCandidate(
         field=field,
-        value=obj.get("value"),
+        value=value,
         kind=kind,
         confidence=conf,
         source=obj.get("source", ""),
